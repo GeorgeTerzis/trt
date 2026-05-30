@@ -1,0 +1,164 @@
+/*
+ * This file is borrowed from an earlier, more ambitious version of this project.
+ * That version got quite far but grew too large and tried to do too much at once.
+ * The goal here is to start simple, get something working, and build up to that level — then surpass it.
+ * Lexing only for now(I do not gurantee that it will work though)
+ */
+core: @mod(
+  mono: @mod (
+    t: @type @rec();
+    make: @fn() t = @(10);
+  );
+
+  empty: @type mono::t;
+  make_empty: @alias mono::make;
+
+  result: @mod{T: @type} (
+    t: @type @var(
+      value: T;
+      empty: mono::t;
+    );
+  );
+);
+
+fnt: @type
+  @fn*(s32; s32; s32) s32;
+
+fnt2: @type
+  @fn(a: s32; b: s32) @var(ok: f128; err: core::mono::t);
+
+fnt3: @type
+  @fn(a: s32; b: s32) @void;
+
+
+alloc: @mod(
+  malloc_ft:     @type @fn(ctx: @ptr; size: u64; alignment: u64)  @ptr;
+  realloc_ft:    @type @fn(ctx: @ptr; ptr: @ptr; newsize: u64) @ptr;
+  free_ft:       @type @fn(ctx: @ptr; ptr: @ptr) @void;
+
+  malloc_ftype:  @type @fn*(@ptr;u64; u64) @ptr;
+  realloc_ftype: @type @fn*(@ptr;@ptr; u64) @ptr;
+  free_ftype:    @type @fn*(@ptr;@ptr) @void;
+
+  vtable: @type @rec(
+    malloc:    malloc_ftype;
+    realloc:   realloc_ftype;
+    free:      free_ftype;
+  );
+
+  t: @type @rec(
+    impl: @ptr;  // opaque pointer to the allocator
+    v: ~vtable;  // pointer to the global vtable
+  );
+);
+
+libc: @mod(
+  alloc: @mod(
+    t: @type @rec();
+
+    malloc: @::alloc::malloc_ft =
+      libc::malloc(size; alignment);
+
+    realloc: @::alloc::realloc_ft =
+      libc::realloc(ptr; size; alignment);
+
+    free: @::alloc::free_ft =
+      libc::free(ptr);
+
+    vtable: @const @::alloc::vtable =
+      @(malloc; realloc; free);
+  );
+);
+
+arena: @mod (
+  t: @type @rec(
+   data: *u8;
+   offset: u64;
+   capacity: u64;
+  );
+
+  next: @fn(arena: ~ @imut t) @ptr =
+    arena::data + arena::offset;
+
+  reset: @fn(arena: ~t) @void =
+    arena::offset = 0;
+
+  malloc: @::alloc::malloc_ft = (
+    arena: ~t = @as(~t)ctx;
+
+    @if(arena::offset + size > arena::capacity)
+      (@ret @null);
+
+    new: @ptr = next(arena);
+    arena::offset += size;
+
+    @ret new;
+  );
+
+  realloc: @::alloc::realloc_ft = (@unreachable);
+  free: @::alloc::free_ft = (@unreachable);
+
+  vtable: @const @::alloc::vtable = @(malloc; realloc; free);
+
+  allocator: @fn(arena: ~t) @::alloc::t =
+    @(@as(@ptr)arena; &vtable);
+);
+
+vector: @mod{T: @type}(
+  t: @type @rec(
+    begin:  *T;
+    end:    *T;
+    cursor: *T;
+
+    allocator: alloc::t;
+  );
+
+  it: @type @rec(
+    data: ~T;
+  );
+
+  make: @fn(allocator: @::alloc::t; capacity: u64) @var(success: t; error: core::empty) = (
+    alignment: u64 = alignof(T);
+    ptr: *T = allocator::alloc(allocator; capacity; alignment);
+
+    @ret @if(ptr)
+            (@(success := @(ptr; ptr + capacity; ptr; allocator)))
+            (@(fail := @::core::mono::make()));
+  );
+
+  size: @fn(self: ~t) u64 =
+    self::begin - self::cursor;
+
+  capacity: @fn(self: ~t) u64 =
+    self::begin - self::end;
+
+  push: @fn(self: ~t; value: T) @var(success: ~T; fail: core::empty) = (
+    csize: @imut u64 = size(self);
+    ccap: @imut u64 = capacity(self);
+
+    @if(csize + 1 > ccap)(
+      newptr := grow(self; csize*2)
+    );
+
+    self::cursor = value;
+    self::cursor += 1;
+
+
+    @ret @(success := ptr);
+  );
+);
+
+type: @type @var(
+  one: u32;
+  two: s32;
+);
+
+var: @type @var(
+  success: f32;
+  fail: @rec();
+);
+
+// expresion at top level is not allowed but here for testing
+10.5e+10
+
+

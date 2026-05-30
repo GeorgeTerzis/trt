@@ -1,0 +1,88 @@
+decl_structs:
+  variable_t:
+    type: ref_type
+    init: ref_expr
+
+  instanced_variable_t:
+    type: ref_type
+
+  argument_t:
+    type: ref_type
+
+  decl_alias_t:
+    ref: ref_decl
+
+  type_alias_t:
+    ref: ref_type
+
+  type_template_input_t:
+    ref: ref_type
+
+  decl_template_input_t:
+    inherits: variable
+
+  function_t:
+    sig: fnsig_t
+    body: ref_expr
+
+  scope_t:
+    inherits: util::frame 
+
+  pattern_group_t:
+   inherits: util::frame 
+   template_inputs: template_inputs_t;
+
+
+type_structs:
+  indirection_variants:
+    variant:
+     - optr_t:
+        empty
+     - array_t:
+        size: ref_expr
+        type: ref_type
+     - ptr_t:
+        type: ref_type
+
+  bitsize_t:
+    size: std::uint16_t
+
+  numeric_variants:
+    float_t:
+        size: bitsize_t
+    sint_t:
+        size: bitsize_t
+    uint_t:
+        size: bitsize_t
+    boolean_t:
+        size: bitsize_t
+
+  string_t:
+    data: std::string_view
+
+  variants:
+    aggregate_variants:
+      rec_t:
+         symbols: symbols_ref
+         decls: list_ref_decl
+      tup_t:
+         inherits: wvec<ref<type_t>>
+
+  aggregate:
+    data: aggregate_variants
+
+  variants:
+    function_variants:
+      fntemplate_t:
+        inherits: fnsig_t
+      fntype_t:
+        args: list_ref_type
+        ret: ref_type
+
+
+  function_t:
+    data: function_variants;
+
+  template_input_t:
+    init: ref_type
+    

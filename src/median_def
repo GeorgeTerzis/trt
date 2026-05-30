@@ -1,0 +1,11 @@
+#ifndef MEDIAN_BASE
+	#define MEDIAN_BASE(code)
+#endif
+
+SYMMETRICAL("(", ")", PARENS)
+
+SYMMETRICAL("{", "}", CBRACES)
+SYMMETRICAL("{{", "}}", DCBRACES)
+
+SYMMETRICAL("[", "]", BRACES)
+SYMMETRICAL("[[", "]]", DBRACES)
