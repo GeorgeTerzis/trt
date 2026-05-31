@@ -2194,10 +2194,17 @@ namespace ast {
             return stmt;
         }
 
-        ref_stmts file(env e, median m) {
-            median_loop(e, m, stmt_fn);
-            return nullptr;
+        ref_stmts stmts_fn(env e, cursor& c) {
+            auto staging = staging_vec<ref_stmt>(e.allocator);
+            node2ast::median_loop(e, c.get().unsafe_median(), [](env e, cursor& c) {
+                node2ast::stmt_fn(e, c);
+            });
+            const auto span = staging.commit();
+
+            ref ptr = e.allocator.alloc_one<stmts_t>(span);
+            return ptr;
         }
+
     } // namespace node2ast
 
     void test_type_eq(allocator_t& allocator) {
@@ -2350,7 +2357,7 @@ namespace ast {
         std::println("all type_eq tests passed");
     }
 
-    void entry(allocator_t& allocator, const lexer::buffer& buffer) {
+    ref_stmts entry(allocator_t& allocator, const lexer::buffer& buffer) {
         auto& node = buffer.get_node(0);
         auto c = cursor{node.children()};
 
@@ -2360,9 +2367,14 @@ namespace ast {
         test_type_eq(allocator);
 
         auto e = env{buffer, allocator, symbols, root};
-        node2ast::median_loop(e, node.unsafe_median(), [](env e, cursor& c) {
-            node2ast::stmt_fn(e, c);
-        });
+
+        auto file = node2ast::stmts_fn(e, c);
+        return file;
+        // auto staging = staging_vec<ref_stmt>(allocator);
+        // node2ast::median_loop(e, node.unsafe_median(), [](env e, cursor& c) {
+        //     node2ast::stmt_fn(e, c);
+        // });
+        // const auto stmts = staging.commit();
     }
 } // namespace ast
 
@@ -2385,7 +2397,8 @@ int main(int argc, char* argv[]) {
     lexer::pretty_print(lexer_output, src);
 
     llvm_allocator arena;
-    ast::entry(arena, lexer_output);
+    auto file = ast::entry(arena, lexer_output);
+    (void)file;
 
     return 0;
 }
