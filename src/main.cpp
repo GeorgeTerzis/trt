@@ -503,11 +503,11 @@ namespace lexer {
             return &it - nodes.begin();
         }
 
-        std::string_view str(source_location loc) {
+        std::string_view str(source_location loc) const {
             return loc.source(src.text);
         }
 
-        std::string_view str(const node* node) {
+        std::string_view str(const node* node) const {
             auto index = to_index(node);
             auto location = loc(index);
             return str(location);
@@ -632,6 +632,13 @@ namespace lexer {
     node get_terminator() {
         return node{final::TERMINATOR};
     }
+    std::uint32_t open_median(unit& u,
+                              median::e code,
+                              string_view src,
+                              std::uint32_t token_begin,
+                              std::uint32_t cursor);
+    auto
+    close_median(std::uint32_t index, unit& u, string_view src, std::uint32_t cursor);
 
     void make_terminator(unit& u,
                          source_view src,
@@ -644,6 +651,7 @@ namespace lexer {
     auto terminator FNSIG {
         auto end = cursor + 1;
         make_terminator(u, src, token_begin, end);
+
         become next(u, src, end, end);
     }
 
@@ -669,11 +677,11 @@ namespace lexer {
             [](const median&) {});
     }
 
-    inline std::uint32_t open_median(unit& u,
-                                     median::e code,
-                                     string_view src,
-                                     std::uint32_t token_begin,
-                                     std::uint32_t cursor) {
+    std::uint32_t open_median(unit& u,
+                              median::e code,
+                              string_view src,
+                              std::uint32_t token_begin,
+                              std::uint32_t cursor) {
 
         auto loc = source_location{u.line, token_begin, token_begin + 1};
         auto index = u.buffer.push(node(code, 0), loc);
@@ -1198,9 +1206,9 @@ namespace ast {
             ref_stmts stmts;
         };
 
-        struct field {
-            std::string_view name;
-            ref_type type;
+        struct unresolved {
+            cursor begin;
+            cursor end;
         };
     } // namespace util
 
@@ -1253,7 +1261,8 @@ namespace ast {
         struct fn_t {
             ref_symbols symbols;
             std::span<ref_decl> args;
-            ref_type return_type;
+            ref_type ret_type;
+            ref_expr body;
         };
 
         struct type_alias_t {
@@ -1271,20 +1280,191 @@ namespace ast {
     namespace stmt_var {
         using decl = ref_decl;
         using expr = ref_expr;
-        using variant = std::variant<decl, expr>;
+
+        struct loop_t {
+            ref_expr cond;
+            ref_expr incr;
+        };
+
+        struct return_t {
+            std::optional<ref_expr> val;
+        };
+        struct break_t {
+            std::optional<ref_expr> val;
+        };
+
+        using variant = std::variant<decl, expr, return_t, break_t>;
     } // namespace stmt_var
 
     struct stmt_t {
         stmt_var::variant data;
     };
 
-    struct stmts_t {};
-    struct expr_t {};
+    struct stmts_t {
+        std::span<ref_stmt> span;
+    };
+
+    namespace expr_var {
+        struct unresolved_t {
+            util::unresolved data;
+        };
+
+        struct int_literal_t {
+            std::uint64_t value;
+        };
+        struct float_literal_t {
+            double value;
+        };
+        struct bool_literal_t {
+            bool value;
+        };
+
+        struct name_t {
+            ref_decl decl;
+        };
+        struct rec_access_t {
+            ref_decl decl;
+        };
+
+        struct call_payload_t {
+            std::span<ref_expr> args;
+        };
+
+        // used to coerse expresions to types
+        struct as_t {
+            ref_type type;
+            ref_expr expr;
+        };
+        struct bitcast_t {
+            ref_type type;
+            ref_expr expr;
+        };
+
+        enum class op_e {
+            opcall,
+            opaccess,
+            opadd,
+            opsub,
+            opmul,
+            opdiv,
+            opand,
+            opor,
+        };
+
+        struct binary_op_t {
+            op_e op;
+            ref_expr lhs;
+            ref_expr rhs;
+        };
+
+        struct unary_op_t {
+            op_e op;
+            ref_expr operand;
+
+            union payload_t {
+                std::span<ref_expr> args;
+                ref_type type;
+            };
+            payload_t payload;
+        };
+
+        using variant = std::variant<unresolved_t,
+                                     as_t,
+                                     call_payload_t,
+                                     int_literal_t,
+                                     float_literal_t,
+                                     bool_literal_t,
+                                     name_t,
+                                     rec_access_t,
+                                     binary_op_t,
+                                     unary_op_t>;
+    } // namespace expr_var
+
+    struct expr_t {
+        ref_expr parent;
+        ref_type type;
+        expr_var::variant data;
+    };
+
+    namespace mutability {
+        enum internal_e : std::int8_t {
+            CONSTANT = 0,
+            IMMUTABLE = 1,
+            MUTABLE = 2,
+            NONE = 3
+        };
+
+        struct t {
+            mutability::internal_e value;
+
+            constexpr t() noexcept : value(NONE) {}
+            constexpr t(const mutability::internal_e v) noexcept : value(v) {}
+        };
+
+        [[nodiscard]] constexpr bool has(const t v) {
+            return v.value != NONE;
+        }
+        [[nodiscard]] constexpr bool is_none(const t v) {
+            return v.value == NONE;
+        }
+        [[nodiscard]] constexpr bool is_mut(const t v) {
+            return v.value == MUTABLE;
+        }
+        [[nodiscard]] constexpr bool is_imut(const t v) {
+            return v.value == IMMUTABLE;
+        }
+        [[nodiscard]] constexpr bool is_const(const t v) {
+            return v.value == CONSTANT;
+        }
+
+        [[nodiscard]] constexpr t ifnone(const t v, const t then) {
+            if (is_none(v))
+                return then;
+            return v;
+        }
+
+        [[nodiscard]] constexpr bool eq(const t lhs, const t rhs) {
+            if (lhs.value == rhs.value)
+                return true;
+
+            const t L = ifnone(lhs, rhs);
+            const t R = ifnone(rhs, lhs);
+
+            return L.value == R.value;
+        }
+
+        [[nodiscard]] constexpr static std::string_view str(const t val) {
+            switch (val.value) {
+            case NONE:
+                return "none";
+            case CONSTANT:
+                return "constant";
+            case IMMUTABLE:
+                return "immutable";
+            case MUTABLE:
+                return "mutable";
+            }
+        }
+
+        [[nodiscard]] constexpr static mutability::t constant() {
+            return CONSTANT;
+        }
+        [[nodiscard]] constexpr static mutability::t mut() {
+            return MUTABLE;
+        }
+        [[nodiscard]] constexpr static mutability::t imut() {
+            return IMMUTABLE;
+        }
+        [[nodiscard]] constexpr static mutability::t none() {
+            return NONE;
+        }
+    }; // namespace mutability
 
     namespace type_var {
         struct uint_t {
             size_t bit_size;
         };
+
         struct sint_t {
             size_t bit_size;
         };
@@ -1299,21 +1479,47 @@ namespace ast {
         using f64_t = fp_base<64>;
         using f128_t = fp_base<128>;
 
+        struct integer_literal_t {};
+        struct float_literal_t {};
+
         struct rec_t {
             ref_symbols symbols;
             std::span<ref_decl> members;
         };
 
+        struct void_t {};
+        struct optr_t {};
         struct ptr_t {
             ref_type type;
         };
 
-        using variant =
-            std::variant<uint_t, sint_t, f16_t, f32_t, f64_t, f128_t, rec_t, ptr_t>;
+        struct type_alias_t {
+            ref_type type;
+        };
+
+        struct unresolved_t {
+            util::unresolved data;
+        };
+
+        using variant = std::variant<unresolved_t,
+                                     type_alias_t,
+                                     integer_literal_t,
+                                     float_literal_t,
+                                     uint_t,
+                                     sint_t,
+                                     f16_t,
+                                     f32_t,
+                                     f64_t,
+                                     f128_t,
+                                     rec_t,
+                                     void_t,
+                                     optr_t,
+                                     ptr_t>;
 
     }; // namespace type_var
 
     struct type_t {
+        mutability::t mut;
         type_var::variant var;
     };
 
@@ -1322,32 +1528,69 @@ namespace ast {
         decl_var::variant data;
     };
 
-    namespace type_eq {
-        bool eq(const ref_type& a, const ref_type& b);
+    struct type_eq {
+        struct policy {
+            static constexpr bool ignore_mutability = false;
+        };
 
-        template <typename A, typename B>
-        bool eq(const A&, const B&) {
+        using trivially_true = type_list<type_var::void_t,
+                                         type_var::optr_t,
+                                         type_var::integer_literal_t,
+                                         type_var::float_literal_t,
+                                         type_var::f16_t,
+                                         type_var::f32_t,
+                                         type_var::f64_t,
+                                         type_var::f128_t>;
+
+        using numeric_cat = type_list<type_var::uint_t, type_var::sint_t>;
+
+        template <typename Policy = policy>
+        static bool eq(const ref_type& a, const ref_type& b) {
+            if (a == b)
+                return true;
+            if (!a || !b)
+                return false;
+            return eq<Policy>(a.deref(), b.deref());
+        }
+
+        template <typename Policy = policy>
+        static bool eq(const type_t& a, const type_t& b) {
+            return std::visit(
+                [](const auto& x, const auto& y) { return eq_impl<Policy>(x, y); },
+                a.var,
+                b.var);
+        }
+
+      private:
+        // default: different types
+        template <typename Policy, typename A, typename B>
+        static bool eq_impl(const A&, const B&) {
             return false;
         }
 
-        inline bool eq(const type_var::uint_t& a, const type_var::uint_t& b) {
-            return a.bit_size == b.bit_size;
-        }
-
-        inline bool eq(const type_var::sint_t& a, const type_var::sint_t& b) {
-            return a.bit_size == b.bit_size;
-        }
-
-        template <size_t S>
-        inline bool eq(const type_var::fp_base<S>&, const type_var::fp_base<S>&) {
+        // trivially true
+        template <typename Policy, typename T>
+            requires is_in_list<T, trivially_true>::value
+        static constexpr bool eq_impl(const T&, const T&) {
             return true;
         }
 
-        inline bool eq(const type_var::ptr_t& a, const type_var::ptr_t& b) {
-            return eq(a.type, b.type);
+        // numeric: compare size
+        template <typename Policy, typename T>
+            requires is_in_list<T, numeric_cat>::value
+        static bool eq_impl(const T& a, const T& b) {
+            return a.bit_size == b.bit_size;
         }
 
-        inline bool eq(const type_var::rec_t& a, const type_var::rec_t& b) {
+        // ptr: recurse
+        template <typename Policy>
+        static bool eq_impl(const type_var::ptr_t& a, const type_var::ptr_t& b) {
+            return eq<Policy>(a.type, b.type);
+        }
+
+        // rec: structural
+        template <typename Policy>
+        static bool eq_impl(const type_var::rec_t& a, const type_var::rec_t& b) {
             if (a.members.size() != b.members.size())
                 return false;
             for (size_t i = 0; i < a.members.size(); ++i) {
@@ -1355,18 +1598,12 @@ namespace ast {
                     std::get<decl_var::rec_member_t>(a.members[i].deref().data).type;
                 const auto& tb =
                     std::get<decl_var::rec_member_t>(b.members[i].deref().data).type;
-                if (!eq(ta, tb))
+                if (!eq<Policy>(ta, tb))
                     return false;
             }
             return true;
         }
-
-        bool eq(const ref_type& a, const ref_type& b) {
-            return std::visit([](const auto& x, const auto& y) { return eq(x, y); },
-                              a.deref().var,
-                              b.deref().var);
-        }
-    } // namespace type_eq
+    };
 
     using allocator_t = llvm_allocator;
 
@@ -1404,6 +1641,12 @@ namespace ast {
         struct always_false : std::false_type {};
     };
 
+    template <median::e med>
+    void consume_untill(cursor& c) {
+        while (c.within() && !c.get().isa(med)) {
+            c++;
+        }
+    }
     template <final::e tok>
     void consume_untill(cursor& c) {
         while (c.within() && !c.get().isa(tok)) {
@@ -1460,14 +1703,13 @@ namespace ast {
 
         template <final::e expected>
         const final& expect_node(const node& n) {
-            if (auto f = n.as_final()) {
-                if (f->get() == expected)
+            if (auto f = n.as_final()) [[likely]] {
+                if (f->get() == expected) [[likely]]
                     return f->get();
                 throw_error(std::format("expected final '{}' but got final '{}'",
                                         lexer::str(expected),
                                         lexer::str(f->get().code)));
-            }
-            if (auto m = n.as_median()) {
+            } else if (auto m = n.as_median()) [[unlikely]] {
                 throw_error(std::format("expected final '{}' but got median '{}'",
                                         lexer::str(expected),
                                         lexer::str(m->get().code)));
@@ -1535,8 +1777,91 @@ namespace ast {
             }
         }
 
+        ref_expr expr_fn(env e, cursor& c);
+
+        namespace expr_patterns {
+            namespace operands {
+                expr_var::variant int_lit(env e, cursor& c) {
+                    const auto index = e.buffer.to_index(&c.get());
+                    const auto text = e.buffer.str(e.buffer.loc(index));
+                    std::uint64_t val;
+                    std::from_chars(text.data(), text.data() + text.size(), val);
+                    c++;
+                    return expr_var::int_literal_t{val};
+                }
+
+                expr_var::variant float_lit(env e, cursor& c) {
+                    const auto index = e.buffer.to_index(&c.get());
+                    const auto text = e.buffer.str(e.buffer.loc(index));
+                    double val;
+                    std::from_chars(text.data(), text.data() + text.size(), val);
+                    c++;
+                    return expr_var::float_literal_t{val};
+                }
+
+                expr_var::variant bool_true(env e, cursor& c) {
+                    c++;
+                    return expr_var::bool_literal_t{true};
+                }
+
+                expr_var::variant bool_false(env e, cursor& c) {
+                    c++;
+                    return expr_var::bool_literal_t{false};
+                }
+
+                expr_var::variant chain(env e, cursor& c) {
+                    const auto begin = c;
+                    expect_node<final::ID>(c++.get());
+                    while (c.within() && c.get().isa(final::DCOLON)) {
+                        c++;
+                        expect_node<final::ID>(c++.get());
+                    }
+                    const auto end = c;
+                    return expr_var::unresolved_t{{begin, end}};
+                }
+            } // namespace operands
+
+            namespace operators {
+                expr_var::variant call(env e, cursor& c, ref_expr callee) {
+                    auto& parens = c++.get().unsafe_median();
+                    expect<median::PARENS>(parens.code);
+
+                    auto staging = staging_vec<ref_expr>(e.allocator);
+                    median_loop(e, parens, [&staging](env e, cursor& c) {
+                        staging.push_back(expr_fn(e, c));
+                    });
+                    auto args = staging.commit();
+
+                    auto payload = expr_var::unary_op_t::payload_t{.args = args};
+                    return expr_var::unary_op_t{
+                        .op = expr_var::op_e::opcall,
+                        .operand = callee,
+                        .payload = payload,
+                    };
+                }
+            } // namespace operators
+        } // namespace expr_patterns
+
         ref_expr expr_fn(env e, cursor& c) {
-            return nullptr;
+            ref ptr = e.allocator.alloc_one<expr_t>();
+            ptr.deref().parent = nullptr;
+
+            ptr.deref().data =
+                path_switch<expr_var::variant>{c}
+                    .path<final::INT>(expr_patterns::operands::int_lit, e, c)
+                    .path<final::FLOAT>(expr_patterns::operands::float_lit, e, c)
+                    .path<final::TRUE>(expr_patterns::operands::bool_true, e, c)
+                    .path<final::FALSE>(expr_patterns::operands::bool_false, e, c)
+                    .path<final::ID>(expr_patterns::operands::chain, e, c)
+                    .def(
+                        [](env e, cursor& c) -> expr_var::variant {
+                            throw_error(std::format("Unknown expression {}",
+                                                    lexer::str(c.get())));
+                        },
+                        e,
+                        c);
+
+            return ptr;
         }
 
         ref_decl alloc_decl(allocator_t& allocator, std::uint32_t name) {
@@ -1609,76 +1934,132 @@ namespace ast {
 
         ref_type type_fn(env e, cursor& c) {
             auto ptr = ref(e.allocator.alloc_one<type_t>());
-            ptr.deref().var = path_switch<type_var::variant>{c}
-                                  .path<final::TYPE_USIZE>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          c++;
-                                          return type_var::uint_t{64};
-                                      },
-                                      e,
-                                      c)
-                                  .path<final::TYPE_ISIZE>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          c++;
-                                          return type_var::sint_t{64};
-                                      },
-                                      e,
-                                      c)
-                                  .path<final::UINT_TYPE>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          const auto len = c++.get().unsafe_final().data;
-                                          return type_var::uint_t{len};
-                                      },
-                                      e,
-                                      c)
-                                  .path<final::SINT_TYPE>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          const auto len = c++.get().unsafe_final().data;
-                                          return type_var::sint_t{len};
-                                      },
-                                      e,
-                                      c)
-                                  .path<final::F16>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          c++;
-                                          return type_var::f16_t{};
-                                      },
-                                      e,
-                                      c)
-                                  .path<final::F32>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          c++;
-                                          return type_var::f32_t{};
-                                      },
-                                      e,
-                                      c)
-                                  .path<final::F64>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          c++;
-                                          return type_var::f64_t{};
-                                      },
-                                      e,
-                                      c)
-                                  .path<final::F128>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          c++;
-                                          return type_var::f128_t{};
-                                      },
-                                      e,
-                                      c)
-                                  .path<final::REC>(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          return type_patterns::rec(e, c);
-                                      },
-                                      e,
-                                      c)
-                                  .def(
-                                      [](env e, cursor& c) -> type_var::variant {
-                                          throw_error(std::format("Unknown type {}",
-                                                                  lexer::str(c.get())));
-                                      },
-                                      e,
-                                      c);
+
+            ptr.deref().mut = [](env e, cursor& c) -> mutability::t {
+                return path_switch<mutability::t>{c}
+                    .path<final::MUTABLE>(
+                        [](cursor& c) -> mutability::t {
+                            c++;
+                            return mutability::mut();
+                        },
+                        c)
+                    .path<final::IMMUTABLE>(
+                        [](cursor& c) -> mutability::t {
+                            c++;
+                            return mutability::imut();
+                        },
+                        c)
+                    .def([](cursor& c) -> mutability::t { return mutability::mut(); }, c);
+            }(e, c);
+
+            ptr.deref().var = [](env e, cursor& c) -> type_var::variant {
+                return path_switch<type_var::variant>{c}
+                    .path<final::ID>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            const auto begin = c;
+                            do {
+                                expect_node<final::ID>(c++.get());
+                            } while (c.get().isa(final::DCOLON) && c++.cursor);
+                            return type_var::unresolved_t{{begin, c}};
+                        },
+                        e,
+                        c)
+                    .path<final::TYPE_USIZE>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            return type_var::uint_t{64};
+                        },
+                        e,
+                        c)
+                    .path<final::TYPE_ISIZE>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            return type_var::sint_t{64};
+                        },
+                        e,
+                        c)
+                    .path<final::UINT_TYPE>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            const auto len = c++.get().unsafe_final().data;
+                            return type_var::uint_t{len};
+                        },
+                        e,
+                        c)
+                    .path<final::SINT_TYPE>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            const auto len = c++.get().unsafe_final().data;
+                            return type_var::sint_t{len};
+                        },
+                        e,
+                        c)
+                    .path<final::F16>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            return type_var::f16_t{};
+                        },
+                        e,
+                        c)
+                    .path<final::F32>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            return type_var::f32_t{};
+                        },
+                        e,
+                        c)
+                    .path<final::F64>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            return type_var::f64_t{};
+                        },
+                        e,
+                        c)
+                    .path<final::F128>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            return type_var::f128_t{};
+                        },
+                        e,
+                        c)
+                    .path<final::REC>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            return type_patterns::rec(e, c);
+                        },
+                        e,
+                        c)
+                    .path<final::VOID>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            return type_var::void_t{};
+                        },
+                        e,
+                        c)
+                    .path<final::OPAQUE>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            bool nullable = true;
+                            return type_var::optr_t{};
+                        },
+                        e,
+                        c)
+                    .path<final::MUL>(
+                        [](env e, cursor& c) -> type_var::variant {
+                            c++;
+                            bool nullable = true;
+                            return type_var::ptr_t{
+                                .type = type_fn(e, c),
+                            };
+                        },
+                        e,
+                        c)
+                    .def(
+                        [](env e, cursor& c) -> type_var::variant {
+                            throw_error(
+                                std::format("Unknown type {}", lexer::str(c.get())));
+                        },
+                        e,
+                        c);
+            }(e, c);
+
             return ptr;
         }
 
@@ -1699,9 +2080,8 @@ namespace ast {
             }
 
             auto fn(env e, cursor& c, ref_decl ptr) {
-                c++; // consume @fn
+                c++;
 
-                // parse parameters
                 ref_symbols symbols = e.allocator.alloc_one<symbols_t>();
                 auto staging = staging_vec<ref_decl>(e.allocator);
 
@@ -1728,7 +2108,7 @@ namespace ast {
 
                 auto args = staging.commit();
 
-                const auto return_type = type_fn(e, c);
+                const auto ret_type = type_fn(e, c);
 
                 expect_node<final::ASIGN>(c++.get());
 
@@ -1738,7 +2118,8 @@ namespace ast {
                 return decl_var::fn_t{
                     .symbols = symbols,
                     .args = args,
-                    .return_type = return_type,
+                    .ret_type = ret_type,
+                    .body = body,
                 };
             }
 
@@ -1773,15 +2154,19 @@ namespace ast {
             }
 
             stmt_var::variant break_fn(env e, cursor& c) {
-                return {};
-            }
-
-            stmt_var::variant become_fn(env e, cursor& c) {
-                return {};
+                c++;
+                if (c.get().isa(final::TERMINATOR))
+                    return stmt_var::break_t{std::nullopt};
+                else
+                    return stmt_var::break_t{expr_fn(e, c)};
             }
 
             stmt_var::variant return_fn(env e, cursor& c) {
-                return {};
+                c++;
+                if (c.get().isa(final::TERMINATOR))
+                    return stmt_var::return_t{std::nullopt};
+                else
+                    return stmt_var::return_t{expr_fn(e, c)};
             }
 
             stmt_var::variant decl_stmt_fn(env e, cursor& c) {
@@ -1790,26 +2175,21 @@ namespace ast {
             }
 
             stmt_var::variant expr_stmt_fn(env e, cursor& c) {
-                return {};
-            }
-
-            stmt_var::variant attributes_fn(env e, cursor& c) {
-                return {};
+                return expr_fn(e, c);
             }
         } // namespace stmt_patterns
 
         ref_stmt stmt_fn(env e, cursor& c) {
-
             auto stmt = e.allocator.alloc_one<stmt_t>();
 
             stmt->data =
                 path_switch<stmt_var::variant>{c}
-                    // .path<median::BRACES>(attribute_fn, e, c)
                     .path<final::ID, final::COLON>(stmt_patterns::decl_stmt_fn, e, c)
-                    // .path<final::LOOP>(stmt_patterns::loop_fn, e, c)
-                    // .path<final::BREAK>(stmt_patterns::break_fn, e, c)
-                    // .path<final::BECOME>(stmt_patterns::become_fn, e, c)
+                    .path<final::BREAK>(stmt_patterns::break_fn, e, c)
                     .path<final::RETURN>(stmt_patterns::return_fn, e, c)
+                    // .path<median::BRACES>(attribute_fn, e, c)
+                    // .path<final::LOOP>(stmt_patterns::loop_fn, e, c)
+                    // .path<final::BECOME>(stmt_patterns::become_fn, e, c)
                     .def(stmt_patterns::expr_stmt_fn, e, c);
             return stmt;
         }
@@ -1991,17 +2371,21 @@ int main(int argc, char* argv[]) {
         std::println("usage: {} <file>", argv[0]);
         return 1;
     }
-
     std::string_view filepath = argv[1];
     lexer::intern_table intern_table;
     auto text = load_file(filepath);
     if (!text) [[unlikely]] {
         throw std::runtime_error(text.error());
     }
+
+    std::println("file=\"{}\"", filepath);
+
     source src{std::string(filepath), std::move(text.value())};
     const auto lexer_output = lexer::entry(src, intern_table);
     lexer::pretty_print(lexer_output, src);
+
     llvm_allocator arena;
     ast::entry(arena, lexer_output);
+
     return 0;
 }
