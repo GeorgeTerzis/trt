@@ -76,7 +76,6 @@
 #define become [[clang::musttail]] return
 
 // I hate this
-// but it is baisacly what I need
 // I could eliminate this by having 2 allocators
 // 1 for temporary allocations like vectors and once they are done I copy paste them to
 // the main one and 1 for long living allocations refrences
@@ -85,7 +84,7 @@ struct staging_vec {
     using Allocator = llvm_allocator;
 
     Allocator& arena;
-    std::vector<T> staging;
+    llvm::SmallVector<T, 5> staging;
 
     explicit staging_vec(llvm_allocator& a) : arena(a) {}
 
@@ -333,6 +332,7 @@ struct node {
 
         return std::optional<std::reference_wrapper<ref_t>>{self.unsafe_final()};
     }
+
     auto as_median(this auto&& self) {
         using value_t = std::remove_reference_t<decltype(self.unsafe_median())>;
 
@@ -1338,6 +1338,10 @@ namespace ast {
             util::unresolved data;
         };
 
+        struct block_t {
+            util::frame frame;
+        };
+
         struct int_literal_t {
             std::uint64_t value;
         };
@@ -1456,6 +1460,7 @@ namespace ast {
         }
 
         using variant = std::variant<unresolved_t,
+                                     block_t,
                                      rec_init_t,
                                      as_t,
                                      call_payload_t,
@@ -1885,6 +1890,7 @@ namespace ast {
 
         ref_type type_fn(env e, cursor& c);
         ref_expr expr_fn(env e, cursor& c, int min_prec = 0);
+        ref_stmts stmts_fn(env e, cursor& c);
 
         namespace expr_patterns {
             ref_expr make_expr(env e, expr_var::variant&& data) {
@@ -1952,6 +1958,15 @@ namespace ast {
                     return expr_var::unresolved_t{{begin, end}};
                 }
 
+                expr_var::variant block(env e, cursor& c) {
+                    const auto& node = c++.get();
+
+                    ref symbols = e.allocator.alloc_one<symbols_t>();
+                    auto stmts_cursor = cursor(node.unsafe_median().children());
+                    const auto stmts = stmts_fn(e.with(symbols), stmts_cursor);
+                    return expr_var::block_t{util::frame(symbols, stmts)};
+                }
+
                 ref_expr parse(env e, cursor& c) {
                     return make_expr(
                         e,
@@ -1962,6 +1977,7 @@ namespace ast {
                             .path<final::TRUE>(bool_true, e, c)
                             .path<final::FALSE>(bool_false, e, c)
                             .path<final::ID>(single_id, e, c)
+                            .path<median::PARENS>(block, e, c)
                             .def(
                                 [](env e, cursor& c) -> expr_var::variant {
                                     throw_error(std::format("Expected operand, got {}",
@@ -1977,19 +1993,19 @@ namespace ast {
                     const auto& v = c.get();
                     if (v.isa(median::PARENS))
                         return expr_var::op_e::opcall;
-                    if (v.isa(final::DCOLON))
+                    else if (v.isa(final::DCOLON))
                         return expr_var::op_e::opaccess;
-                    if (v.isa(final::PLUS))
+                    else if (v.isa(final::PLUS))
                         return expr_var::op_e::opadd;
-                    if (v.isa(final::MINUS))
+                    else if (v.isa(final::MINUS))
                         return expr_var::op_e::opsub;
-                    if (v.isa(final::MUL))
+                    else if (v.isa(final::MUL))
                         return expr_var::op_e::opmul;
-                    if (v.isa(final::DIV))
+                    else if (v.isa(final::DIV))
                         return expr_var::op_e::opdiv;
-                    if (v.isa(final::LOGICAL_AND))
+                    else if (v.isa(final::LOGICAL_AND))
                         return expr_var::op_e::opand;
-                    if (v.isa(final::LOGICAL_OR))
+                    else if (v.isa(final::LOGICAL_OR))
                         return expr_var::op_e::opor;
                     return std::nullopt;
                 }
@@ -2041,14 +2057,14 @@ namespace ast {
         ref_expr expr_fn(env e, cursor& c, int min_prec) {
             ref_expr lhs = expr_patterns::operands::parse(e, c);
 
-            while (c.within() && !c.get().isa(final::TERMINATOR)) {
+            {
                 const auto maybe_op = expr_patterns::operators::peek_op(c);
                 if (!maybe_op)
-                    break;
+                    return lhs;
 
                 const auto meta = expr_var::op_meta(*maybe_op);
                 if (expr_var::left_bp(meta) < min_prec)
-                    break;
+                    return lhs;
 
                 if (meta.is_postfix()) {
                     lhs = expr_patterns::operators::parse_postfix(e, c, lhs, *maybe_op);
@@ -2403,160 +2419,6 @@ namespace ast {
         }
 
     } // namespace node2ast
-
-    // void test_type_eq(allocator_t& allocator) {
-    //     // uint same size
-    //     {
-    //         std::println("test: uint same size");
-    //         ref a = allocator.alloc_one<type_t>();
-    //         ref b = allocator.alloc_one<type_t>();
-    //         a.deref().var = type_var::uint_t{32};
-    //         b.deref().var = type_var::uint_t{32};
-    //         assert(type_eq::eq(a, b));
-    //         std::println("  pass");
-    //     }
-    //     // uint different size
-    //     {
-    //         std::println("test: uint different size");
-    //         ref a = allocator.alloc_one<type_t>();
-    //         ref b = allocator.alloc_one<type_t>();
-    //         a.deref().var = type_var::uint_t{32};
-    //         b.deref().var = type_var::uint_t{64};
-    //         assert(!type_eq::eq(a, b));
-    //         std::println("  pass");
-    //     }
-    //     // uint vs sint
-    //     {
-    //         std::println("test: uint vs sint");
-    //         ref a = allocator.alloc_one<type_t>();
-    //         ref b = allocator.alloc_one<type_t>();
-    //         a.deref().var = type_var::uint_t{32};
-    //         b.deref().var = type_var::sint_t{32};
-    //         assert(!type_eq::eq(a, b));
-    //         std::println("  pass");
-    //     }
-    //     // ptr to same type
-    //     {
-    //         std::println("test: ptr to same type");
-    //         ref inner_a = allocator.alloc_one<type_t>();
-    //         ref inner_b = allocator.alloc_one<type_t>();
-    //         inner_a.deref().var = type_var::uint_t{32};
-    //         inner_b.deref().var = type_var::uint_t{32};
-
-    //         ref a = allocator.alloc_one<type_t>();
-    //         ref b = allocator.alloc_one<type_t>();
-    //         a.deref().var = type_var::ptr_t{inner_a};
-    //         b.deref().var = type_var::ptr_t{inner_b};
-    //         assert(type_eq::eq(a, b));
-    //         std::println("  pass");
-    //     }
-    //     // ptr to different types
-    //     {
-    //         std::println("test: ptr to different types");
-    //         ref inner_a = allocator.alloc_one<type_t>();
-    //         ref inner_b = allocator.alloc_one<type_t>();
-    //         inner_a.deref().var = type_var::uint_t{32};
-    //         inner_b.deref().var = type_var::uint_t{64};
-
-    //         ref a = allocator.alloc_one<type_t>();
-    //         ref b = allocator.alloc_one<type_t>();
-    //         a.deref().var = type_var::ptr_t{inner_a};
-    //         b.deref().var = type_var::ptr_t{inner_b};
-    //         assert(!type_eq::eq(a, b));
-    //         std::println("  pass");
-    //     }
-    //     // rec same members
-    //     {
-    //         std::println("test: rec same members");
-    //         ref symbols_a = allocator.alloc_one<symbols_t>();
-    //         ref symbols_b = allocator.alloc_one<symbols_t>();
-
-    //         ref field_type_a = allocator.alloc_one<type_t>();
-    //         ref field_type_b = allocator.alloc_one<type_t>();
-    //         field_type_a.deref().var = type_var::uint_t{32};
-    //         field_type_b.deref().var = type_var::uint_t{32};
-
-    //         ref mem_a =
-    //             allocator.alloc_one<decl_t>(0, decl_var::rec_member_t{field_type_a,
-    //             0});
-    //         ref mem_b =
-    //             allocator.alloc_one<decl_t>(0, decl_var::rec_member_t{field_type_b,
-    //             0});
-
-    //         auto span_a = allocator.alloc_many<ref_decl>(1);
-    //         span_a[0] = mem_a;
-
-    //         auto span_b = allocator.alloc_many<ref_decl>(1);
-    //         span_b[0] = mem_b;
-
-    //         ref a = allocator.alloc_one<type_t>();
-    //         ref b = allocator.alloc_one<type_t>();
-    //         a.deref().var = type_var::rec_t{symbols_a, span_a};
-    //         b.deref().var = type_var::rec_t{symbols_b, span_b};
-    //         assert(type_eq::eq(a, b));
-    //         std::println("  pass");
-    //     }
-    //     // rec different member types
-    //     {
-    //         std::println("test: rec different member types");
-    //         ref symbols_a = allocator.alloc_one<symbols_t>();
-    //         ref symbols_b = allocator.alloc_one<symbols_t>();
-
-    //         ref field_type_a = allocator.alloc_one<type_t>();
-    //         ref field_type_b = allocator.alloc_one<type_t>();
-    //         field_type_a.deref().var = type_var::uint_t{32};
-    //         field_type_b.deref().var = type_var::uint_t{64};
-
-    //         ref mem_a =
-    //             allocator.alloc_one<decl_t>(0, decl_var::rec_member_t{field_type_a,
-    //             0});
-    //         ref mem_b =
-    //             allocator.alloc_one<decl_t>(0, decl_var::rec_member_t{field_type_b,
-    //             0});
-
-    //         auto span_a = allocator.alloc_many<ref_decl>(1);
-    //         span_a[0] = mem_a;
-
-    //         auto span_b = allocator.alloc_many<ref_decl>(1);
-    //         span_b[0] = mem_b;
-
-    //         ref a = allocator.alloc_one<type_t>();
-    //         ref b = allocator.alloc_one<type_t>();
-    //         a.deref().var = type_var::rec_t{symbols_a, span_a};
-    //         b.deref().var = type_var::rec_t{symbols_b, span_b};
-    //         assert(!type_eq::eq(a, b));
-    //         std::println("  pass");
-    //     }
-    //     // rec different member count
-    //     {
-    //         std::println("test: rec different member count");
-    //         ref symbols_a = allocator.alloc_one<symbols_t>();
-    //         ref symbols_b = allocator.alloc_one<symbols_t>();
-
-    //         ref ft = allocator.alloc_one<type_t>();
-    //         ft.deref().var = type_var::uint_t{32};
-
-    //         ref mem_a1 = allocator.alloc_one<decl_t>(0, decl_var::rec_member_t{ft, 0});
-    //         ref mem_a2 = allocator.alloc_one<decl_t>(0, decl_var::rec_member_t{ft, 1});
-    //         ref mem_b = allocator.alloc_one<decl_t>(0, decl_var::rec_member_t{ft, 0});
-
-    //         auto span_a = allocator.alloc_many<ref_decl>(2);
-    //         span_a[0] = mem_a1;
-    //         span_a[1] = mem_a2;
-
-    //         auto span_b = allocator.alloc_many<ref_decl>(1);
-    //         span_b[0] = mem_b;
-
-    //         ref a = allocator.alloc_one<type_t>();
-    //         ref b = allocator.alloc_one<type_t>();
-    //         a.deref().var = type_var::rec_t{symbols_a, span_a};
-    //         b.deref().var = type_var::rec_t{symbols_b, span_b};
-    //         assert(!type_eq::eq(a, b));
-    //         std::println("  pass");
-    //     }
-
-    //     std::println("all type_eq tests passed");
-    // }
 
     ref_stmts entry(allocator_t& allocator, const lexer::buffer& buffer) {
         auto& node = buffer.get_node(0);
