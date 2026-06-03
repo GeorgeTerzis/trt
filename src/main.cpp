@@ -2411,7 +2411,9 @@ namespace ast {
         ref_stmts stmts_fn(env e, cursor& c) {
             auto staging = staging_vec<ref_stmt>(e.allocator);
 
-            ch_loop(e, c, [](env e, cursor& c) { node2ast::stmt_fn(e, c); });
+            ch_loop(e, c, [&staging](env e, cursor& c) {
+                staging.push_back(node2ast::stmt_fn(e, c));
+            });
             const auto span = staging.commit();
 
             ref ptr = e.allocator.alloc_one<stmts_t>(span);
@@ -2419,6 +2421,332 @@ namespace ast {
         }
 
     } // namespace node2ast
+
+    // Devilish
+    //  I kinda like it but at the same time I hate it
+    //  WHY USE STD::FUNCTION TO RESOLVE AND NOT PASS THE Unit or whatever other context?
+    //  it works though so it is what it is who gives a cares about the printer
+    // maybe not what i had hopped from the MachineGod gemmini to give me back
+    // hard coding the operators is diaboloical
+    // this thing will be a nihtmare to update
+    namespace SLOP {
+        struct printer {
+          public:
+            std::ostream& os;
+            int indent_level = 0;
+
+            // A customizable resolver callback to map interned string IDs back to text.
+            std::function<std::string(std::uint32_t)> name_resolver;
+
+            explicit printer(
+                std::ostream& out,
+                std::function<std::string(std::uint32_t)> resolver = nullptr) :
+                os(out),
+                name_resolver(resolver) {
+                if (!name_resolver) {
+                    name_resolver = [](std::uint32_t id) {
+                        return "id_" + std::to_string(id);
+                    };
+                }
+            }
+
+            // Convenience overloads for handling your custom smart-pointer wrappers
+            // (`ref<T>`)
+            void print(const ref_type& t) {
+                if (!t) {
+                    os << "null";
+                } else {
+                    print(t.deref());
+                }
+            }
+            void print(const ref_expr& e) {
+                if (!e) {
+                    os << "null";
+                } else {
+                    print(e.deref());
+                }
+            }
+            void print(const ref_decl& d) {
+                if (!d) {
+                    os << "null";
+                } else {
+                    print(d.deref());
+                }
+            }
+            void print(const ref_stmt& s) {
+                if (!s) {
+                    os << "null";
+                } else {
+                    print(s.deref());
+                }
+            }
+            void print(const ref_stmts& ss) {
+                if (!ss) {
+                    os << "null";
+                } else {
+                    print(ss.deref());
+                }
+            }
+
+            void print(const type_t& t);
+            void print(const expr_t& e);
+            void print(const stmt_t& s);
+            void print(const stmts_t& s);
+            void print(const decl_t& d);
+
+          private:
+            void emit_indent() {
+                for (int i = 0; i < indent_level; ++i) {
+                    os << "    ";
+                }
+            }
+        };
+
+        // --- Type Printer ---
+        void printer::print(const type_t& t) {
+            if (mutability::has(t.mut)) {
+                os << mutability::str(t.mut) << " ";
+            }
+
+            std::visit(
+                [this](const auto& arg) {
+                    using T = std::decay_t<decltype(arg)>;
+
+                    if constexpr (std::is_same_v<T, type_var::void_t>) {
+                        os << "void";
+                    } else if constexpr (std::is_same_v<T, type_var::optr_t>) {
+                        os << "optr";
+                    } else if constexpr (std::is_same_v<T, type_var::integer_literal_t>) {
+                        os << "int_literal";
+                    } else if constexpr (std::is_same_v<T, type_var::float_literal_t>) {
+                        os << "float_literal";
+                    } else if constexpr (std::is_same_v<T, type_var::uint_t>) {
+                        os << "u" << arg.bit_size;
+                    } else if constexpr (std::is_same_v<T, type_var::sint_t>) {
+                        os << "i" << arg.bit_size;
+                    } else if constexpr (std::is_same_v<T, type_var::f16_t> ||
+                                         std::is_same_v<T, type_var::f32_t> ||
+                                         std::is_same_v<T, type_var::f64_t> ||
+                                         std::is_same_v<T, type_var::f128_t>) {
+                        os << "f" << arg.bit_size;
+                    } else if constexpr (std::is_same_v<T, type_var::ptr_t>) {
+                        os << "*";
+                        print(arg.type);
+                    } else if constexpr (std::is_same_v<T, type_var::type_alias_t>) {
+                        print(arg.type);
+                    } else if constexpr (std::is_same_v<T, type_var::unresolved_t>) {
+                        os << "<unresolved_type>";
+                    } else if constexpr (std::is_same_v<T, type_var::rec_t>) {
+                        os << "struct {\n";
+                        indent_level++;
+                        for (const auto& member : arg.members) {
+                            emit_indent();
+                            print(member);
+                            os << ";\n";
+                        }
+                        indent_level--;
+                        emit_indent();
+                        os << "}";
+                    }
+                },
+                t.var);
+        }
+
+        // --- Expression Printer ---
+        void printer::print(const expr_t& e) {
+            std::visit(
+                [this](const auto& arg) {
+                    using T = std::decay_t<decltype(arg)>;
+
+                    if constexpr (std::is_same_v<T, expr_var::int_literal_t>) {
+                        os << arg.value;
+                    } else if constexpr (std::is_same_v<T, expr_var::float_literal_t>) {
+                        os << arg.value;
+                    } else if constexpr (std::is_same_v<T, expr_var::bool_literal_t>) {
+                        os << (arg.value ? "true" : "false");
+                    } else if constexpr (std::is_same_v<T, expr_var::name_t>) {
+                        os << (arg.decl ? name_resolver(arg.decl.deref().name)
+                                        : "<null_name>");
+                    } else if constexpr (std::is_same_v<T, expr_var::rec_access_t>) {
+                        os << "."
+                           << (arg.decl ? name_resolver(arg.decl.deref().name)
+                                        : "<null_field>");
+                    } else if constexpr (std::is_same_v<T, expr_var::unresolved_t>) {
+                        os << "<unresolved_expr>";
+                    } else if constexpr (std::is_same_v<T, expr_var::as_t>) {
+                        print(arg.expr);
+                        os << " as ";
+                        print(arg.type);
+                    } else if constexpr (std::is_same_v<T, expr_var::bitcast_t>) {
+                        os << "bitcast<";
+                        print(arg.type);
+                        os << ">(";
+                        print(arg.expr);
+                        os << ")";
+                    } else if constexpr (std::is_same_v<T, expr_var::rec_init_t>) {
+                        print(arg.type);
+                        os << "{ ";
+                        for (size_t i = 0; i < arg.args.size(); ++i) {
+                            print(arg.args[i]);
+                            if (i + 1 < arg.args.size())
+                                os << ", ";
+                        }
+                        os << " }";
+                    } else if constexpr (std::is_same_v<T, expr_var::call_payload_t>) {
+                        os << "(";
+                        for (size_t i = 0; i < arg.args.size(); ++i) {
+                            print(arg.args[i]);
+                            if (i + 1 < arg.args.size())
+                                os << ", ";
+                        }
+                        os << ")";
+                    } else if constexpr (std::is_same_v<T, expr_var::binary_op_t>) {
+                        std::string_view op_str;
+                        switch (arg.op) {
+                        case expr_var::op_e::opaccess:
+                            op_str = "::";
+                            break;
+                        case expr_var::op_e::opadd:
+                            op_str = " + ";
+                            break;
+                        case expr_var::op_e::opsub:
+                            op_str = " - ";
+                            break;
+                        case expr_var::op_e::opmul:
+                            op_str = " * ";
+                            break;
+                        case expr_var::op_e::opdiv:
+                            op_str = " / ";
+                            break;
+                        case expr_var::op_e::opand:
+                            op_str = " && ";
+                            break;
+                        case expr_var::op_e::opor:
+                            op_str = " || ";
+                            break;
+                        default:
+                            op_str = " <op> ";
+                            break;
+                        }
+                        os << "(";
+                        print(arg.lhs);
+                        os << op_str;
+                        print(arg.rhs);
+                        os << ")";
+                    } else if constexpr (std::is_same_v<T, expr_var::unary_op_t>) {
+                        if (arg.op == expr_var::op_e::opcall) {
+                            print(arg.operand);
+                            os << "(";
+                            for (size_t i = 0; i < arg.payload.args.size(); ++i) {
+                                print(arg.payload.args[i]);
+                                if (i + 1 < arg.payload.args.size())
+                                    os << ", ";
+                            }
+                            os << ")";
+                        } else {
+                            os << "<unary_op>";
+                        }
+                    } else if constexpr (std::is_same_v<T, expr_var::block_t>) {
+                        os << "{\n";
+                        indent_level++;
+                        print(arg.frame.stmts);
+                        indent_level--;
+                        emit_indent();
+                        os << "}";
+                    }
+                },
+                e.data);
+        }
+
+        // --- Statement Printer ---
+        void printer::print(const stmt_t& s) {
+            std::visit(
+                [this](const auto& arg) {
+                    using T = std::decay_t<decltype(arg)>;
+
+                    if constexpr (std::is_same_v<T, stmt_var::decl>) {
+                        print(arg);
+                        os << ";";
+                    } else if constexpr (std::is_same_v<T, stmt_var::expr>) {
+                        print(arg);
+                        os << ";";
+                    } else if constexpr (std::is_same_v<T, stmt_var::return_t>) {
+                        os << "return";
+                        if (arg.val) {
+                            os << " ";
+                            print(*arg.val);
+                        }
+                        os << ";";
+                    } else if constexpr (std::is_same_v<T, stmt_var::break_t>) {
+                        os << "break";
+                        if (arg.val) {
+                            os << " ";
+                            print(*arg.val);
+                        }
+                        os << ";";
+                    } else if constexpr (std::is_same_v<T, stmt_var::loop_t>) {
+                        os << "loop (cond: ";
+                        print(arg.cond);
+                        os << ", incr: ";
+                        print(arg.incr);
+                        os << ")";
+                    }
+                },
+                s.data);
+        }
+
+        void printer::print(const stmts_t& s) {
+            for (const auto& stmt : s.span) {
+                emit_indent();
+                print(stmt);
+                os << "\n";
+            }
+        }
+
+        // --- Declaration Printer ---
+        void printer::print(const decl_t& d) {
+            std::visit(
+                [this, &d](const auto& arg) {
+                    using T = std::decay_t<decltype(arg)>;
+
+                    if constexpr (std::is_same_v<T, decl_var::var_t>) {
+                        print(arg.type);
+                        os << " " << name_resolver(d.name);
+                        if (arg.init_expr) {
+                            os << " = ";
+                            print(arg.init_expr);
+                        }
+                    } else if constexpr (std::is_same_v<T, decl_var::rec_member_t>) {
+                        os << name_resolver(d.name) << " : ";
+                        print(arg.type);
+                    } else if constexpr (std::
+                                             is_same_v<T,
+                                                       decl_var::tagged_union_member_t>) {
+                        os << "variant " << name_resolver(d.name) << " : ";
+                        print(arg.type);
+                    } else if constexpr (std::is_same_v<T, decl_var::fn_parameter_t>) {
+                        os << name_resolver(d.name) << " : ";
+                        print(arg.type);
+                    } else if constexpr (std::is_same_v<T, decl_var::type_alias_t>) {
+                        os << "type " << name_resolver(d.name) << " = ";
+                        print(arg.type);
+                    } else if constexpr (std::is_same_v<T, decl_var::fn_t>) {
+                        os << "fn " << name_resolver(d.name) << "(";
+                        for (size_t i = 0; i < arg.args.size(); ++i) {
+                            // Prints parameters as definitions inside signature
+                            print(arg.args[i]);
+                            if (i + 1 < arg.args.size())
+                                os << ", ";
+                        }
+                        os << ") -> ";
+                        print(arg.ret_type);
+                        os << " ";
+                        print(arg.body);
+                    }
+                },
+                d.data);
+        }
+    } // namespace SLOP
 
     ref_stmts entry(allocator_t& allocator, const lexer::buffer& buffer) {
         auto& node = buffer.get_node(0);
@@ -2432,13 +2760,14 @@ namespace ast {
         auto e = env{buffer, allocator, symbols, root};
 
         auto file = node2ast::stmts_fn(e, c);
+
         return file;
     }
 } // namespace ast
 
 namespace codegen {
-    // copy pasted from language
-    // so I still have to see what I will do with the cache
+    // copy pasted from language (in other words OLD,TOUCH NEEDED)
+    // It will need some kind of cache for sure
     struct unit {
       private:
         llvm_allocator a;
@@ -2581,11 +2910,16 @@ int main(int argc, char* argv[]) {
 
     source src{std::string(filepath), std::move(text.value())};
     const auto lexer_output = lexer::entry(src, intern_table);
-    lexer::pretty_print(lexer_output, src);
+    // lexer::pretty_print(lexer_output, src);
 
     llvm_allocator arena;
     auto file = ast::entry(arena, lexer_output);
 
+    {
+        // I should hook up the inter_table
+        auto slpp = ast::SLOP::printer(std::cerr);
+        slpp.print(file);
+    }
     auto llvm_unit = codegen::unit(filepath);
     return 0;
 }
