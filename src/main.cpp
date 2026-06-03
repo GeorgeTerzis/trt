@@ -2057,14 +2057,14 @@ namespace ast {
         ref_expr expr_fn(env e, cursor& c, int min_prec) {
             ref_expr lhs = expr_patterns::operands::parse(e, c);
 
-            {
+            while (c.within() && !c.get().isa(final::TERMINATOR)) {
                 const auto maybe_op = expr_patterns::operators::peek_op(c);
                 if (!maybe_op)
-                    return lhs;
+                    break;
 
                 const auto meta = expr_var::op_meta(*maybe_op);
                 if (expr_var::left_bp(meta) < min_prec)
-                    return lhs;
+                    break;
 
                 if (meta.is_postfix()) {
                     lhs = expr_patterns::operators::parse_postfix(e, c, lhs, *maybe_op);
