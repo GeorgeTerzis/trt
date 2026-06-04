@@ -1,22 +1,36 @@
 // a simple dynamic array arena
-arena: @type @rec(
-    capacity: usize;
-    length: usize;
-    data: opaque;
+// arena: @type @rec(
+//     capacity: usize;
+//     length: usize;
+//     data: opaque;
+// );
+
+
+// arena_init: @fn(capacity: usize) arena = (
+//     length: usize = 0;
+//     data: opaque = cmalloc(capacity);
+//     ret @(arena)(capacity; length; data);
+// );
+
+// arena_new: @fn(capacity: usize) arena = arena_init(capacity);
+// arena_alloc: @fn(a: *arena; size: usize; align: usize) opaque = arena_alloc_impl(a; size; align);
+// arena_len: @fn(a: *arena) usize = a::length;
+// arena_is_full: @fn(a: *arena) usize = a::length and a::capacity;
+
+
+
+B: @type @rec(
+    mem0: s32;
+);
+
+A: @type @rec(
+  mem0: C;
+  mem1: B;   
+);
+
+C: @type @rec(
+    mem0: f32;
 );
 
 
-arena_init: @fn(capacity: usize) arena = (
-    length: usize = 0;
-    data: opaque = cmalloc(capacity);
-    ret @(arena)(capacity; length; data);
-);
-
-arena_new: @fn(capacity: usize) arena = arena_init(capacity);
-arena_alloc: @fn(a: *arena; size: usize; align: usize) opaque = arena_alloc_impl(a; size; align);
-arena_len: @fn(a: *arena) usize = a::length;
-arena_is_full: @fn(a: *arena) usize = a::length and a::capacity;
-
-
-10 + (50 + 20);
-
+a + 20;

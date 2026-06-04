@@ -8,18 +8,20 @@
 #include "../libs/llvm_allocator.hpp"
 #include "../libs/map.hpp"
 #include "../libs/meta.hpp"
-#include "../libs/overloaded.hpp"
 #include "../libs/ref.hpp"
 #include "../libs/vector.hpp"
 
 // Not used yet
 // #include <boost/mp11/algorithm.hpp>
 // #include <boost/mp11/utility.hpp>
+#include <boost/pfr/core.hpp>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cwctype>
+#include <flat_map>
+#include <flat_set>
 #include <format>
 #include <functional>
 #include <iostream>
@@ -74,6 +76,14 @@
 #include <wchar.h>
 
 #define become [[clang::musttail]] return
+
+template <typename... Func>
+struct overload : Func... {
+    using Func::operator()...;
+};
+
+template <typename... Func>
+overload(Func...) -> overload<Func...>;
 
 // I hate this
 // I could eliminate this by having 2 allocators
@@ -204,7 +214,7 @@ struct final {
         last,
     };
     e code;
-    uint32_t data = 0;
+    uint32_t data = 0; // IDs use it for names
 
     explicit final(e c) : code(c) {}
     explicit final(e c, uint32_t d) : code(c), data(d) {}
@@ -1165,24 +1175,21 @@ using intern_id = std::uint32_t;
 namespace ast {
     using cursor = const_cursor_t;
 
-    struct ast_t;
     struct decl_t;
     struct type_t;
     struct expr_t;
     struct stmt_t;
     struct stmts_t;
-    struct symbols_t;
+    struct scope_t;
 
     using ref_type = ref<type_t>;
     using ref_expr = ref<expr_t>;
     using ref_decl = ref<decl_t>;
     using ref_stmts = ref<stmts_t>;
     using ref_stmt = ref<stmt_t>;
-    using ref_ast = ref<ast_t>;
-    using ref_symbols = ref<symbols_t>;
+    using ref_scope = ref<scope_t>;
 
-    struct ast_t {};
-    struct symbols_t {
+    struct scope_t {
         using entry_t = ref_decl;
 
         struct insertion {
@@ -1192,16 +1199,15 @@ namespace ast {
         };
 
         struct lookup_result {
-            ref_symbols where;
+            ref_scope where;
             entry_t symbol;
         };
 
-        ref_symbols parent;
+        ref_scope parent;
         map<intern_id, entry_t> table = {};
 
         template <bool is_local>
-        static std::optional<lookup_result> lookup_impl(ref_symbols& self,
-                                                        intern_id key) {
+        static std::optional<lookup_result> lookup_impl(ref_scope& self, intern_id key) {
             assert(self.is_valid());
             auto it = self.deref().table.find(key);
             if (it != self.deref().table.end())
@@ -1212,17 +1218,17 @@ namespace ast {
             return std::nullopt;
         }
 
-        static std::optional<lookup_result> local_lookup(ref_symbols& self,
+        static std::optional<lookup_result> local_lookup(ref_scope& self,
                                                          intern_id name) {
             return lookup_impl<true>(self, name);
         }
 
-        static std::optional<lookup_result> ancestor_lookup(ref_symbols& self,
+        static std::optional<lookup_result> ancestor_lookup(ref_scope& self,
                                                             intern_id name) {
             return lookup_impl<false>(self, name);
         }
 
-        static ref_symbols get_root(ref_symbols current) {
+        static ref_scope get_root(ref_scope current) {
             if (!current.deref().parent)
                 return current;
             [[clang::musttail]] return get_root(current.deref().parent);
@@ -1231,41 +1237,18 @@ namespace ast {
 
     namespace util {
         struct frame {
-            ref_symbols symbols;
+            ref_scope scope;
             ref_stmts stmts;
         };
 
-        struct unresolved {
+        struct unresolved_range {
             cursor begin;
             cursor end;
         };
+        struct unresolved_name {
+            intern_id name;
+        };
     } // namespace util
-
-    struct fnsig_t {
-        ref_symbols symbols;
-        ref_type ret;
-        vector<ref_decl> args;
-    };
-
-    struct template_inputs_t {
-        vector<ref_decl> args;
-    };
-
-    template <typename T>
-    struct template_input_t {
-        using type = T;
-        T data;
-    };
-
-    struct template_init {
-        using list = type_list<ref_decl, ref_type, ref_expr>;
-
-        ref_decl original;
-
-        using input_t = ref_type;
-        using inputs_t = vector<input_t>;
-        inputs_t inputs;
-    };
 
     namespace decl_var {
         struct var_t {
@@ -1288,7 +1271,7 @@ namespace ast {
         };
 
         struct fn_t {
-            ref_symbols symbols;
+            ref_scope scope;
             std::span<ref_decl> args;
             ref_type ret_type;
             ref_expr body;
@@ -1307,17 +1290,23 @@ namespace ast {
     }; // namespace decl_var
 
     namespace stmt_var {
-        using decl = ref_decl;
-        using expr = ref_expr;
+
+        struct decl {
+            ref_decl ref;
+        };
+        struct expr {
+            ref_expr ref;
+        };
 
         struct loop_t {
             ref_expr cond;
-            ref_expr incr;
+            std::optional<ref_expr> incr;
         };
 
         struct return_t {
             std::optional<ref_expr> val;
         };
+
         struct break_t {
             std::optional<ref_expr> val;
         };
@@ -1335,13 +1324,11 @@ namespace ast {
 
     namespace expr_var {
         struct unresolved_t {
-            util::unresolved data;
+            util::unresolved_name name;
         };
-
         struct block_t {
             util::frame frame;
         };
-
         struct int_literal_t {
             std::uint64_t value;
         };
@@ -1576,7 +1563,7 @@ namespace ast {
         struct float_literal_t {};
 
         struct rec_t {
-            ref_symbols symbols;
+            ref_scope scope;
             std::span<ref_decl> members;
         };
 
@@ -1591,7 +1578,7 @@ namespace ast {
         };
 
         struct unresolved_t {
-            util::unresolved data;
+            util::unresolved_range data;
         };
 
         using variant = std::variant<unresolved_t,
@@ -1613,7 +1600,7 @@ namespace ast {
 
     struct type_t {
         mutability::t mut;
-        type_var::variant var;
+        type_var::variant data;
     };
 
     struct decl_t {
@@ -1650,8 +1637,8 @@ namespace ast {
         static bool eq(const type_t& a, const type_t& b) {
             return std::visit(
                 [](const auto& x, const auto& y) { return eq_impl<Policy>(x, y); },
-                a.var,
-                b.var);
+                a.data,
+                b.data);
         }
 
       private:
@@ -1704,8 +1691,8 @@ namespace ast {
       public:
         const lexer::buffer& buffer;
         allocator_t& allocator;
-        ref_symbols symbols;
-        ref_ast parent;
+        ref_scope scope;
+        // ref_ast parent;
 
         template <typename... Args>
         env with(Args&&... args) const noexcept {
@@ -1720,10 +1707,10 @@ namespace ast {
             using U = std::decay_t<T>;
             if constexpr (std::is_same_v<U, allocator_t>) {
                 allocator = value;
-            } else if constexpr (std::is_same_v<U, ref_symbols>) {
-                symbols = std::forward<T>(value);
-            } else if constexpr (std::is_same_v<U, ref_ast>) {
-                parent = std::forward<T>(value);
+            } else if constexpr (std::is_same_v<U, ref_scope>) {
+                scope = std::forward<T>(value);
+                // } else if constexpr (std::is_same_v<U, ref_ast>) {
+                //     parent = std::forward<T>(value);
             } else {
                 static_assert(always_false<U>::value,
                               "Unsupported type passed to env::with()");
@@ -1770,7 +1757,7 @@ namespace ast {
 
         template <typename R>
         struct path_switch {
-            cursor c;
+            const cursor c;
             std::optional<R> result;
 
             explicit path_switch(cursor& c) : c(c) {}
@@ -1952,19 +1939,17 @@ namespace ast {
                 }
 
                 expr_var::variant single_id(env e, cursor& c) {
-                    const auto begin = c;
-                    expect_node<final::ID>(c++.get());
-                    const auto end = c;
-                    return expr_var::unresolved_t{{begin, end}};
+                    const auto name = expect_node<final::ID>(c++.get()).data;
+                    return expr_var::unresolved_t{name};
                 }
 
                 expr_var::variant block(env e, cursor& c) {
                     const auto& node = c++.get();
 
-                    ref symbols = e.allocator.alloc_one<symbols_t>();
+                    ref scope = e.allocator.alloc_one<scope_t>();
                     auto stmts_cursor = cursor(node.unsafe_median().children());
-                    const auto stmts = stmts_fn(e.with(symbols), stmts_cursor);
-                    return expr_var::block_t{util::frame(symbols, stmts)};
+                    const auto stmts = stmts_fn(e.with(scope), stmts_cursor);
+                    return expr_var::block_t{util::frame(scope, stmts)};
                 }
 
                 ref_expr parse(env e, cursor& c) {
@@ -2083,12 +2068,12 @@ namespace ast {
         }
 
         ref_decl alloc_and_insert_decl(env e, intern_id name) {
-            const auto lookup = symbols_t::local_lookup(e.symbols, name);
+            const auto lookup = scope_t::local_lookup(e.scope, name);
             if (lookup) {
                 throw_error("Found symbol with the same name");
             }
             auto mem = alloc_decl(e.allocator, name);
-            const auto [_, inserted] = e.symbols.deref().table.emplace(name, mem);
+            const auto [_, inserted] = e.scope.deref().table.emplace(name, mem);
             if (!inserted)
                 throw_error("Unable to insert declaration");
 
@@ -2116,32 +2101,29 @@ namespace ast {
 
                 auto mr = e.allocator.memory_resource();
 
-                ref_symbols symbols = e.allocator.alloc_one<symbols_t>();
+                ref scope = e.allocator.alloc_one<scope_t>();
 
                 auto staging = staging_vec<ref_decl>(e.allocator);
-                median_loop(
-                    e.with(symbols),
-                    members,
-                    [&staging](env e, cursor& c) -> void {
-                        const auto index = static_cast<std::uint32_t>(staging.size());
-                        const auto mem =
-                            path_switch<ref_decl>(c)
-                                .path<final::ID, final::COLON>(member_decl, e, c, index)
-                                .def(
-                                    [](env e, cursor& c, std::uint32_t i) -> ref_decl {
-                                        throw_error("Expected member declaration "
-                                                    "found something else");
-                                    },
-                                    e,
-                                    c,
-                                    index);
+                median_loop(e.with(scope), members, [&staging](env e, cursor& c) -> void {
+                    const auto index = static_cast<std::uint32_t>(staging.size());
+                    const auto mem =
+                        path_switch<ref_decl>(c)
+                            .path<final::ID, final::COLON>(member_decl, e, c, index)
+                            .def(
+                                [](env e, cursor& c, std::uint32_t i) -> ref_decl {
+                                    throw_error("Expected member declaration "
+                                                "found something else");
+                                },
+                                e,
+                                c,
+                                index);
 
-                        staging.push_back(mem);
-                    });
+                    staging.push_back(mem);
+                });
                 c++;
 
                 auto member_span = staging.commit();
-                return {.symbols = symbols, .members = member_span};
+                return {.scope = scope, .members = member_span};
             }
         } // namespace type_patterns
 
@@ -2165,7 +2147,7 @@ namespace ast {
                     .def([](cursor& c) -> mutability::t { return mutability::mut(); }, c);
             }(e, c);
 
-            ptr.deref().var = [](env e, cursor& c) -> type_var::variant {
+            ptr.deref().data = [](env e, cursor& c) -> type_var::variant {
                 return path_switch<type_var::variant>{c}
                     .path<final::ID>(
                         [](env e, cursor& c) -> type_var::variant {
@@ -2295,29 +2277,26 @@ namespace ast {
             auto fn(env e, cursor& c, ref_decl ptr) {
                 c++;
 
-                ref_symbols symbols = e.allocator.alloc_one<symbols_t>();
+                ref_scope scope = e.allocator.alloc_one<scope_t>();
                 auto staging = staging_vec<ref_decl>(e.allocator);
 
                 auto& parens = c++.get().unsafe_median();
                 expect<median::PARENS>(parens.code);
 
                 std::uint32_t index = 0;
-                median_loop(
-                    e.with(symbols),
-                    parens,
-                    [&staging, &index](env e, cursor& c) {
-                        auto& name_node = c++.get();
-                        auto name = name_node.unsafe_final().data;
+                median_loop(e.with(scope), parens, [&staging, &index](env e, cursor& c) {
+                    auto& name_node = c++.get();
+                    auto name = name_node.unsafe_final().data;
 
-                        expect_node<final::COLON>(c++.get());
+                    expect_node<final::COLON>(c++.get());
 
-                        const auto type = type_fn(e, c);
+                    const auto type = type_fn(e, c);
 
-                        auto param = alloc_and_insert_decl(e, name);
-                        param.deref().data =
-                            decl_var::fn_parameter_t{.type = type, .index = index++};
-                        staging.push_back(param);
-                    });
+                    auto param = alloc_and_insert_decl(e, name);
+                    param.deref().data =
+                        decl_var::fn_parameter_t{.type = type, .index = index++};
+                    staging.push_back(param);
+                });
 
                 auto args = staging.commit();
 
@@ -2329,7 +2308,7 @@ namespace ast {
                 consume_untill<final::TERMINATOR>(c);
 
                 return decl_var::fn_t{
-                    .symbols = symbols,
+                    .scope = scope,
                     .args = args,
                     .ret_type = ret_type,
                     .body = body,
@@ -2385,11 +2364,11 @@ namespace ast {
 
             stmt_var::variant decl_stmt_fn(env e, cursor& c) {
                 auto decl = decl_fn(e, c);
-                return {decl};
+                return stmt_var::decl{decl};
             }
 
             stmt_var::variant expr_stmt_fn(env e, cursor& c) {
-                return expr_fn(e, c);
+                return stmt_var::expr{expr_fn(e, c)};
             }
         } // namespace stmt_patterns
 
@@ -2549,7 +2528,7 @@ namespace ast {
                         os << "}";
                     }
                 },
-                t.var);
+                t.data);
         }
 
         // --- Expression Printer ---
@@ -2665,10 +2644,10 @@ namespace ast {
                     using T = std::decay_t<decltype(arg)>;
 
                     if constexpr (std::is_same_v<T, stmt_var::decl>) {
-                        print(arg);
+                        print(arg.ref);
                         os << ";";
                     } else if constexpr (std::is_same_v<T, stmt_var::expr>) {
-                        print(arg);
+                        print(arg.ref);
                         os << ";";
                     } else if constexpr (std::is_same_v<T, stmt_var::return_t>) {
                         os << "return";
@@ -2748,18 +2727,131 @@ namespace ast {
         }
     } // namespace SLOP
 
+    template <typename T>
+    struct is_ref : std::false_type {};
+    template <typename T>
+    struct is_ref<ref<T>> : std::true_type {};
+    template <typename T>
+    inline constexpr bool is_ref_v = is_ref<T>::value;
+
+    template <typename T>
+    struct is_variant : std::false_type {};
+    template <typename... Ts>
+    struct is_variant<std::variant<Ts...>> : std::true_type {};
+    template <typename T>
+    inline constexpr bool is_variant_v = is_variant<T>::value;
+
+    template <typename T>
+    struct is_span_of_ref : std::false_type {};
+    template <typename T>
+    struct is_span_of_ref<std::span<ref<T>>> : std::true_type {};
+    template <typename T>
+    inline constexpr bool is_span_of_ref_v = is_span_of_ref<T>::value;
+
+    template <typename T>
+    struct is_optional_of_ref : std::false_type {};
+    template <typename T>
+    struct is_optional_of_ref<std::optional<ref<T>>> : std::true_type {};
+    template <typename T>
+    inline constexpr bool is_optional_of_ref_v = is_optional_of_ref<T>::value;
+
+    namespace walker {
+
+        template <typename Derived>
+        struct t {
+
+            constexpr Derived* derived() {
+                return static_cast<Derived*>(this);
+            }
+
+            template <typename Base, typename T>
+            void for_each_member(ref<Base> ptr, T& v) {
+                boost::pfr::for_each_field(v, [&]<typename F>(F& field) {
+                    if constexpr (is_ref_v<F> && !std::is_same_v<ref_scope, F>) {
+                        visit(field);
+                    } else if constexpr (is_optional_of_ref_v<F>) {
+                        if (field) {
+                            visit(*field);
+                        }
+                    } else if constexpr (is_span_of_ref_v<F>) {
+                        for (auto& elm : field) {
+                            visit(elm);
+                        }
+                    }
+                });
+            }
+
+            template <typename Ref>
+                requires is_ref_v<Ref>
+            void visit(Ref ptr) {
+                if constexpr (requires { ptr.deref().data; }) {
+                    std::visit(overload{[&](auto& v) {
+                                   derived()->entry(ptr, v);
+                                   for_each_member(ptr, v);
+                                   derived()->exit(ptr, v);
+                               }},
+                               ptr.deref().data);
+                } else if constexpr (requires { ptr.deref().span; }) {
+                    for (auto& elm : ptr.deref().span) {
+                        visit(elm);
+                    }
+                }
+            }
+        };
+    } // namespace walker
+
+    struct Resolver : walker::t<Resolver> {
+        ref_scope scope;
+        std::flat_set<void*> resolving;
+
+        void insert(void* ptr) {
+            if (resolving.contains(ptr))
+                throw std::runtime_error("Recursive resolution attempted");
+
+            resolving.insert(ptr);
+        }
+        void remove(void* ptr) {
+            if (!resolving.contains(ptr))
+                throw std::runtime_error("Attempted to erase non existant entry");
+
+            resolving.erase(ptr);
+        }
+
+        void entry(ref_decl ptr, decl_var::type_alias_t& v) {}
+
+        void entry(ref_expr ptr, expr_var::unresolved_t& v) {
+            insert(ptr.as_void());
+            std::println("Resolving range id={}", v.name.name);
+            remove(ptr.as_void());
+        }
+
+        void entry(ref_type ptr, type_var::unresolved_t& v) {
+            insert(ptr.as_void());
+            std::println("Resolving range={}-{}",
+                         (void*)v.data.begin.cursor,
+                         (void*)v.data.end.cursor);
+            remove(ptr.as_void());
+        }
+
+        void entry(auto ptr, auto& v) {}
+        void exit(auto ptr, auto& v) {}
+    };
+
     ref_stmts entry(allocator_t& allocator, const lexer::buffer& buffer) {
         auto& node = buffer.get_node(0);
         auto c = cursor{node.children()};
 
-        auto symbols = allocator.alloc_one<symbols_t>();
-        auto root = allocator.alloc_one<ast_t>();
+        ref scope = allocator.alloc_one<scope_t>();
+        // auto root = allocator.alloc_one<ast_t>();
 
         // test_type_eq(allocator);
 
-        auto e = env{buffer, allocator, symbols, root};
+        auto e = env{buffer, allocator, scope, /* root */};
 
         auto file = node2ast::stmts_fn(e, c);
+
+        Resolver v;
+        v.visit(file);
 
         return file;
     }
@@ -2852,7 +2944,7 @@ namespace codegen {
 
                     ++i;
                 }
-                std::println("{}", feature_str);
+                // std::println("{}", feature_str);
             }
         }
 
@@ -2916,7 +3008,11 @@ int main(int argc, char* argv[]) {
     auto file = ast::entry(arena, lexer_output);
 
     {
+        // ast::ASTInspector inspector;
+        // inspector.visit_stmt(file.deref().span[0]);
         // I should hook up the inter_table
+        //
+        std::println("\n");
         auto slpp = ast::SLOP::printer(std::cerr);
         slpp.print(file);
     }
