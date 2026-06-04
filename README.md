@@ -28,6 +28,7 @@ Walks the node buffer and constructs a typed AST. Declarations, types, statement
 **Resolution**
 
 `ast::walker::t` and `ast::Resolver`
+
 I now am experimenting with a Walker CRPT to lower the boilerplate and make it a bit more managable.
 Our only limitations come from `boost::pfr` that we are using to do reflection which is that we have to keep our AST as pods(plain old data).
 which means no inheritance, private members, etc..
