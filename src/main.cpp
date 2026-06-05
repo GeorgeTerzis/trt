@@ -590,6 +590,12 @@ namespace lexer {
 
     auto next FNSIG;
 
+    auto peek(source_view src, std::uint32_t cursor) -> unsigned char {
+        if (!within_src(src, cursor + 1))
+            return 0;
+        return static_cast<unsigned char>(src[cursor + 1]);
+    }
+
     constexpr string_view str(final::e e) {
         switch (e) {
 #define TOKEN_BASE(code)                                                                 \
@@ -672,6 +678,7 @@ namespace lexer {
     node get_terminator() {
         return node{final::TERMINATOR};
     }
+
     std::uint32_t open_median(unit& u,
                               median::e code,
                               string_view src,
@@ -684,7 +691,6 @@ namespace lexer {
                          source_view src,
                          const uint32_t& token_begin,
                          uint32_t& end) {
-
         u.last_terminator_depth = u.depth;
         u.buffer.push(get_terminator(), source_location{u.line, token_begin, end});
     }
@@ -695,28 +701,35 @@ namespace lexer {
         become next(u, src, end, end);
     }
 
-    void cond_insert_invisible_separator(unit& u) {
-        auto& last_node = u.buffer.out.nodes.back();
-        auto& last_loc = u.buffer.out.locs.back();
+    // void cond_insert_invisible_separator(unit& u) {
+    //     auto& last_node = u.buffer.out.nodes.back();
+    //     auto& last_loc = u.buffer.out.locs.back();
 
-        last_node.visit(
-            [&](const final& f) {
-                auto loc = last_loc;
-                loc.end_index = 0;
+    //     last_node.visit(
+    //         [&](const final& f) {
+    //             auto loc = last_loc;
+    //             loc.end_index = 0;
 
-                bool depth_equal = (u.last_terminator_depth == u.depth);
-                bool is_terminator = (f == final::TERMINATOR);
-                if (u.prev_depth != u.last_terminator_depth) {
-                    u.buffer.push(get_terminator(), loc);
-                } else if (depth_equal && is_terminator) {
-                } else if (depth_equal && !is_terminator) {
-                    u.buffer.push(get_terminator(), loc);
-                } else if (!depth_equal) {
-                    u.buffer.push(get_terminator(), loc);
-                }
-            },
-            [](const median&) {});
-    }
+    //             bool depth_equal = (u.last_terminator_depth == u.depth - 1);
+    //             bool is_terminator = (f == final::TERMINATOR);
+
+    //             u.buffer.push(get_terminator(), loc);
+    //             // if (u.prev_depth != u.last_terminator_depth) {
+    //             //     u.last_terminator_depth = u.depth;
+
+    //             //     u.buffer.push(get_terminator(), loc);
+    //             // } else if (skip) {
+    //             // } else if (depth_equal && !is_terminator) {
+    //             //     u.last_terminator_depth = u.depth;
+
+    //             //     u.buffer.push(get_terminator(), loc);
+    //             // } else if (!depth_equal) {
+    //             //     u.last_terminator_depth = u.depth;
+
+    //             // }
+    //         },
+    //         [](const median&) {});
+    // }
 
     std::uint32_t open_median(unit& u,
                               median::e code,
@@ -778,14 +791,27 @@ namespace lexer {
             auto open_index = u.openstack.back();
             u.openstack.pop_back();
 
-            // mismatched delimiter
             if (!symetrical_close_match(open_index.code, c)) [[unlikely]]
                 std::abort();
-            cond_insert_invisible_separator(u);
+
+            auto prev_non_whitespace = [&]() -> unsigned char {
+                auto i = cursor - 2;
+                while (i > 0 && (whitesapce::is_horizontal(src[i]) ||
+                                 whitesapce::is_vertical(src[i])))
+                    --i;
+                return static_cast<unsigned char>(src[i]);
+            };
+
+            if (prev_non_whitespace() != ';') {
+                auto loc = u.buffer.out.locs.back();
+                loc.end_index = 0;
+                u.buffer.push(get_terminator(), loc);
+                u.last_terminator_depth = u.depth;
+            }
+
             close_median(open_index.index, u, src, cursor);
             return next(u, src, cursor, cursor);
         }
-
     } // namespace symmetrical
 
     auto strlit FNSIG {
@@ -1106,7 +1132,7 @@ namespace lexer {
     }
 
     auto close_file_median(unit& u, string_view src) {
-        cond_insert_invisible_separator(u);
+        // cond_insert_invisible_separator(u);
         close_median(0, u, src, src.size());
     }
 
