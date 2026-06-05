@@ -19,18 +19,22 @@
 
 
 
-B: @type @rec(
-    mem0: s32;
-);
+// B: @type @rec(
+//     mem0: s32;
+//     mem1: C;
+// );
 
-A: @type @rec(
-  mem0: C;
-  mem1: B;   
-);
+// A: @type @rec(
+//   mem0: C;
+//   mem1: B;   
+// );
 
-C: @type @rec(
-    mem0: f32;
-);
+// C: @type @rec(
+//     mem0: f32;
+// );
 
 
-a + 20;
+a: A = @(A)(10; @(C)(20));
+
+
+

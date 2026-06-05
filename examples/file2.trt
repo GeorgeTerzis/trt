@@ -1,0 +1,15 @@
+variable: mut s32 = 10;
+still_mutable: s32 = 10;
+immutable_variable: imut s32 = 10;
+constant: const s32 = 10; // not supported yet
+
+
+pointer: *s32 = null;
+opaque_pointer: opaque = null;
+
+
+type: @type @rec(
+    member: s32;
+    member2: u32;
+    member3: f128;
+);

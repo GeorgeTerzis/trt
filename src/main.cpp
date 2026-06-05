@@ -573,7 +573,8 @@ namespace lexer {
 
         uint32_t line = 1;
         uint32_t depth = 0;
-        std::uint32_t last_terminator_depth = 0;
+        uint32_t last_terminator_depth = 0;
+        uint32_t prev_depth = 0; // tracks per open and close
     };
 
 #define RET void
@@ -705,10 +706,11 @@ namespace lexer {
 
                 bool depth_equal = (u.last_terminator_depth == u.depth);
                 bool is_terminator = (f == final::TERMINATOR);
-
-                if (depth_equal && !is_terminator) {
+                if (u.prev_depth != u.last_terminator_depth) {
                     u.buffer.push(get_terminator(), loc);
                 } else if (depth_equal && is_terminator) {
+                } else if (depth_equal && !is_terminator) {
+                    u.buffer.push(get_terminator(), loc);
                 } else if (!depth_equal) {
                     u.buffer.push(get_terminator(), loc);
                 }
@@ -724,6 +726,7 @@ namespace lexer {
 
         auto loc = source_location{u.line, token_begin, token_begin + 1};
         auto index = u.buffer.push(node(code, 0), loc);
+        u.prev_depth = u.depth;
         ++u.depth;
         return index;
     }
@@ -740,6 +743,7 @@ namespace lexer {
             auto& open_source_location = u.buffer.out.loc(index);
             open_source_location.end_index = cursor;
         }
+        u.prev_depth = u.depth;
         --u.depth;
     }
 
@@ -1734,6 +1738,39 @@ namespace ast {
         }
     }
 
+    ref_scope make_scope(allocator_t& allocator, ref_scope parent = {}) {
+        ref_scope scope = allocator.alloc_one<scope_t>();
+        scope.deref().parent = parent;
+        return scope;
+    }
+
+    ref_scope make_scope(const env& e) {
+        return make_scope(e.allocator, e.scope);
+    }
+
+    ref_expr make_expr(env e, expr_var::variant&& data) {
+        ref ptr = e.allocator.alloc_one<expr_t>();
+        ptr.deref().parent = nullptr;
+        ptr.deref().data = std::move(data);
+        return ptr;
+    }
+    ref_decl alloc_decl(allocator_t& allocator, std::uint32_t name) {
+        return allocator.alloc_one<decl_t>(name, decl_var::variant{});
+    }
+
+    ref_decl alloc_and_insert_decl(env e, intern_id name) {
+        const auto lookup = scope_t::local_lookup(e.scope, name);
+        if (lookup) {
+            throw_error("Found symbol with the same name");
+        }
+        auto mem = alloc_decl(e.allocator, name);
+        const auto [_, inserted] = e.scope.deref().table.emplace(name, mem);
+        if (!inserted)
+            throw_error("Unable to insert declaration");
+
+        return mem;
+    }
+
     namespace node2ast {
         template <auto... kind>
             requires((cmp_v<decltype(kind), final::e> ||
@@ -1880,12 +1917,6 @@ namespace ast {
         ref_stmts stmts_fn(env e, cursor& c);
 
         namespace expr_patterns {
-            ref_expr make_expr(env e, expr_var::variant&& data) {
-                ref ptr = e.allocator.alloc_one<expr_t>();
-                ptr.deref().parent = nullptr;
-                ptr.deref().data = std::move(data);
-                return ptr;
-            }
 
             namespace operands {
                 expr_var::variant int_lit(env e, cursor& c) {
@@ -1946,7 +1977,7 @@ namespace ast {
                 expr_var::variant block(env e, cursor& c) {
                     const auto& node = c++.get();
 
-                    ref scope = e.allocator.alloc_one<scope_t>();
+                    ref scope = make_scope(e);
                     auto stmts_cursor = cursor(node.unsafe_median().children());
                     const auto stmts = stmts_fn(e.with(scope), stmts_cursor);
                     return expr_var::block_t{util::frame(scope, stmts)};
@@ -2063,23 +2094,6 @@ namespace ast {
             return lhs;
         }
 
-        ref_decl alloc_decl(allocator_t& allocator, std::uint32_t name) {
-            return allocator.alloc_one<decl_t>(name, decl_var::variant{});
-        }
-
-        ref_decl alloc_and_insert_decl(env e, intern_id name) {
-            const auto lookup = scope_t::local_lookup(e.scope, name);
-            if (lookup) {
-                throw_error("Found symbol with the same name");
-            }
-            auto mem = alloc_decl(e.allocator, name);
-            const auto [_, inserted] = e.scope.deref().table.emplace(name, mem);
-            if (!inserted)
-                throw_error("Unable to insert declaration");
-
-            return mem;
-        }
-
         ref_decl member_decl(env e, cursor& c, std::uint32_t i) {
             auto& name_node = c++.get();
             auto name = name_node.unsafe_final().data;
@@ -2101,7 +2115,7 @@ namespace ast {
 
                 auto mr = e.allocator.memory_resource();
 
-                ref scope = e.allocator.alloc_one<scope_t>();
+                ref scope = make_scope(e);
 
                 auto staging = staging_vec<ref_decl>(e.allocator);
                 median_loop(e.with(scope), members, [&staging](env e, cursor& c) -> void {
@@ -2803,6 +2817,7 @@ namespace ast {
     struct Resolver : walker::t<Resolver> {
         ref_scope scope;
         std::flat_set<void*> resolving;
+        std::vector<ref_scope> scopes;
 
         void insert(void* ptr) {
             if (resolving.contains(ptr))
@@ -2819,11 +2834,25 @@ namespace ast {
 
         void entry(ref_decl ptr, decl_var::type_alias_t& v) {}
 
-        void entry(ref_expr ptr, expr_var::unresolved_t& v) {
-            insert(ptr.as_void());
-            std::println("Resolving range id={}", v.name.name);
-            remove(ptr.as_void());
+        void entry(ref_expr ptr, expr_var::binary_op_t& v) {
+            if (v.op == expr_var::op_e::opaccess) {
+                // lhs should provide the scope when resolving rhs
+                auto lhs = [&] { auto ptr = v.lhs; };
+                auto rhs = [&] { auto ptr = v.rhs; };
+            }
         }
+        void exit(ref_expr ptr, expr_var::binary_op_t& v) {
+            if (v.op == expr_var::op_e::opaccess) {
+                // lhs should provide the scope when resolving rhs
+            }
+        }
+        // void entry(ref_expr ptr, expr_var::unresolved_t& v) {
+        //     insert(ptr.as_void());
+
+        //     std::println("Resolving range id={}", v.name.name);
+
+        //     remove(ptr.as_void());
+        // }
 
         void entry(ref_type ptr, type_var::unresolved_t& v) {
             insert(ptr.as_void());
@@ -2841,7 +2870,7 @@ namespace ast {
         auto& node = buffer.get_node(0);
         auto c = cursor{node.children()};
 
-        ref scope = allocator.alloc_one<scope_t>();
+        ref scope = make_scope(allocator);
         // auto root = allocator.alloc_one<ast_t>();
 
         // test_type_eq(allocator);
@@ -3002,7 +3031,7 @@ int main(int argc, char* argv[]) {
 
     source src{std::string(filepath), std::move(text.value())};
     const auto lexer_output = lexer::entry(src, intern_table);
-    // lexer::pretty_print(lexer_output, src);
+    lexer::pretty_print(lexer_output, src);
 
     llvm_allocator arena;
     auto file = ast::entry(arena, lexer_output);
