@@ -126,19 +126,3 @@ trt.out file.trt
 **`usize` and `isize`** are currently hardcoded to 64-bit. The plan is to derive them from the target system at compile time.
 
 ---
-
-## Status
-- [x] UTF8
-- [x] Lexer
-- [x] Node buffer + pretty printer
-- [x] Type parsing
-- [x] Record type parsing
-- [x] Variable and type alias declarations
-- [x] Function declaration parsing (body stubbed)
-- [x] Symbol table with scoped lookup
-- [x] Type structural equality (`type_eq`)
-- [ ] Expression parsing
-- [ ] Statement bodies (loop, break, return)
-- [ ] Recursive type aliasing
-- [ ] Symbol resolution
-- [ ] LLVM backend
