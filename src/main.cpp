@@ -11,9 +11,6 @@
 #include "../libs/ref.hpp"
 #include "../libs/vector.hpp"
 
-// Not used yet
-// #include <boost/mp11/algorithm.hpp>
-// #include <boost/mp11/utility.hpp>
 #include <boost/pfr/core.hpp>
 #include <cassert>
 #include <cstddef>
@@ -145,6 +142,8 @@ using list = llvm::SmallVector<T, 0>;
 
 using string_view = std::string_view;
 using string = std::string;
+
+using intern_id = std::uint32_t;
 
 [[noreturn]] auto
 throw_error(std::source_location loc = std::source_location::current()) {
@@ -1173,7 +1172,9 @@ namespace lexer {
     void pretty_print(const buffer& buf, source_view src) {
         std::span<const node> s(&buf.get_node(0), 1);
         auto i = const_cursor_t(s);
-        return internal_pretty_print(buf, src, i, 0);
+        internal_pretty_print(buf, src, i, 0);
+        std::println("\n");
+        return;
     }
 
     buffer entry(source& src, intern_table& itable) {
@@ -1200,8 +1201,6 @@ namespace lexer {
 #undef RET
 } // namespace lexer
 
-using intern_id = std::uint32_t;
-
 namespace ast {
     using cursor = const_cursor_t;
 
@@ -1222,12 +1221,6 @@ namespace ast {
     struct scope_t {
         using entry_t = ref_decl;
 
-        struct insertion {
-            const bool is_inserted;
-            const intern_id name;
-            entry_t symbol;
-        };
-
         struct lookup_result {
             ref_scope where;
             entry_t symbol;
@@ -1242,6 +1235,7 @@ namespace ast {
             auto it = self.deref().table.find(key);
             if (it != self.deref().table.end())
                 return lookup_result{self, it->second};
+
             if constexpr (!is_local)
                 if (self.deref().parent)
                     return lookup_impl<false>(self.deref().parent, key);
@@ -1372,10 +1366,6 @@ namespace ast {
             ref_decl decl;
         };
 
-        struct rec_access_t {
-            ref_decl decl;
-        };
-
         struct rec_init_t {
             ref_type type;
             std::span<ref_expr> args;
@@ -1395,9 +1385,14 @@ namespace ast {
             ref_expr expr;
         };
 
+        struct access_t {
+            ref_expr lhs;
+            ref_expr rhs;
+        };
+
         enum class op_e {
             opcall,
-            opaccess,
+            // opaccess,
             opadd,
             opsub,
             opmul,
@@ -1453,8 +1448,8 @@ namespace ast {
             case op_e::opcall:
                 return {op_pos::postfix, 7};
             // infix
-            case op_e::opaccess:
-                return {op_pos::infix, 7};
+            // case op_e::opaccess:
+            //     return {op_pos::infix, 7};
             case op_e::opmul:
                 return {op_pos::infix, 6};
             case op_e::opdiv:
@@ -1477,6 +1472,7 @@ namespace ast {
         }
 
         using variant = std::variant<unresolved_t,
+                                     access_t,
                                      block_t,
                                      rec_init_t,
                                      as_t,
@@ -1485,7 +1481,7 @@ namespace ast {
                                      float_literal_t,
                                      bool_literal_t,
                                      name_t,
-                                     rec_access_t,
+                                     // rec_access_t,
                                      binary_op_t,
                                      unary_op_t>;
     } // namespace expr_var
@@ -1797,6 +1793,41 @@ namespace ast {
         return mem;
     }
 
+    ref_scope scope_of_type(const ref_type& t);
+    ref_scope scope_of_decl(const ref_decl& d);
+
+    ref_scope scope_of(const type_var::rec_t& v) {
+        return v.scope;
+    }
+
+    ref_scope scope_of(const type_var::type_alias_t& v) {
+        return scope_of_type(v.type);
+    }
+
+    ref_scope scope_of(const type_var::ptr_t& v) {
+        return scope_of_type(v.type);
+    }
+
+    template <typename T>
+    ref_scope scope_of(const T&) {
+        throw_error(std::format("Cannot get scope of type {}", type_str<T>()));
+    }
+
+    ref_scope scope_of_type(const ref_type& t) {
+        return std::visit([](const auto& v) { return scope_of(v); }, t.deref().data);
+    }
+
+    ref_scope scope_of_decl(const ref_decl& d) {
+        return std::visit(
+            overload{
+                [](const decl_var::type_alias_t& v) { return scope_of_type(v.type); },
+                [](const auto&) -> ref_scope {
+                    throw_error("Cannot get scope of non-type decl");
+                },
+            },
+            d.deref().data);
+    }
+
     namespace node2ast {
         template <auto... kind>
             requires((cmp_v<decltype(kind), final::e> ||
@@ -1975,7 +2006,6 @@ namespace ast {
 
                 expr_var::variant rec_init(env e, cursor& c) {
                     c++;
-
                     auto& type_parens = c++.get().unsafe_median();
                     expect<median::PARENS>(type_parens.code);
                     auto type_c = cursor(type_parens.children());
@@ -2009,6 +2039,22 @@ namespace ast {
                     return expr_var::block_t{util::frame(scope, stmts)};
                 }
 
+                ref_expr parse(env e, cursor& c);
+
+                template <auto fn>
+                expr_var::variant can_chain(env e, cursor& c) {
+                    auto lhs = fn(e, c);
+                    if (!c->isa(final::DCOLON)) {
+                        return lhs;
+                    }
+                    c++;
+
+                    auto rhs_ptr = parse(e, c);
+                    auto lhs_ptr = make_expr(e, std::move(lhs));
+
+                    return expr_var::access_t{lhs_ptr, rhs_ptr};
+                }
+
                 ref_expr parse(env e, cursor& c) {
                     return make_expr(
                         e,
@@ -2018,8 +2064,8 @@ namespace ast {
                             .path<final::FLOAT>(float_lit, e, c)
                             .path<final::TRUE>(bool_true, e, c)
                             .path<final::FALSE>(bool_false, e, c)
-                            .path<final::ID>(single_id, e, c)
-                            .path<median::PARENS>(block, e, c)
+                            .path<final::ID>(can_chain<single_id>, e, c)
+                            .path<median::PARENS>(can_chain<block>, e, c)
                             .def(
                                 [](env e, cursor& c) -> expr_var::variant {
                                     throw_error(std::format("Expected operand, got {}",
@@ -2035,8 +2081,8 @@ namespace ast {
                     const auto& v = c.get();
                     if (v.isa(median::PARENS))
                         return expr_var::op_e::opcall;
-                    else if (v.isa(final::DCOLON))
-                        return expr_var::op_e::opaccess;
+                    // else if (v.isa(final::DCOLON))
+                    //         return expr_var::op_e::opaccess;
                     else if (v.isa(final::PLUS))
                         return expr_var::op_e::opadd;
                     else if (v.isa(final::MINUS))
@@ -2184,7 +2230,8 @@ namespace ast {
                             return mutability::imut();
                         },
                         c)
-                    .def([](cursor& c) -> mutability::t { return mutability::mut(); }, c);
+                    .def([](cursor& c) -> mutability::t { return mutability::none(); },
+                         c);
             }(e, c);
 
             ptr.deref().data = [](env e, cursor& c) -> type_var::variant {
@@ -2317,7 +2364,7 @@ namespace ast {
             auto fn(env e, cursor& c, ref_decl ptr) {
                 c++;
 
-                ref_scope scope = e.allocator.alloc_one<scope_t>();
+                auto scope = make_scope(e);
                 auto staging = staging_vec<ref_decl>(e.allocator);
 
                 auto& parens = c++.get().unsafe_median();
@@ -2449,324 +2496,316 @@ namespace ast {
     // hard coding the operators is diaboloical
     // this thing will be a nihtmare to update
     namespace SLOP {
+
+        static std::string default_name_resolver(std::uint32_t id) {
+            return "id_" + std::to_string(id);
+        }
+
+        template <typename NameResolver = decltype(&default_name_resolver)>
         struct printer {
-          public:
             std::ostream& os;
-            int indent_level = 0;
+            NameResolver resolve;
+            int indent = 0;
 
-            // A customizable resolver callback to map interned string IDs back to text.
-            std::function<std::string(std::uint32_t)> name_resolver;
+            explicit printer(std::ostream& os,
+                             NameResolver resolve = &default_name_resolver) :
+                os(os),
+                resolve(std::move(resolve)) {}
 
-            explicit printer(
-                std::ostream& out,
-                std::function<std::string(std::uint32_t)> resolver = nullptr) :
-                os(out),
-                name_resolver(resolver) {
-                if (!name_resolver) {
-                    name_resolver = [](std::uint32_t id) {
-                        return "id_" + std::to_string(id);
-                    };
-                }
+            // --- ref overloads ---
+
+            void print(ref_type t) {
+                t ? print(t.deref()) : (void)(os << "null");
+            }
+            void print(ref_expr e) {
+                e ? print(e.deref()) : (void)(os << "null");
+            }
+            void print(ref_decl d) {
+                d ? print(d.deref()) : (void)(os << "null");
+            }
+            void print(ref_stmt s) {
+                s ? print(s.deref()) : (void)(os << "null");
+            }
+            void print(ref_stmts s) {
+                s ? print(s.deref()) : (void)(os << "null");
             }
 
-            // Convenience overloads for handling your custom smart-pointer wrappers
-            // (`ref<T>`)
-            void print(const ref_type& t) {
-                if (!t) {
-                    os << "null";
-                } else {
-                    print(t.deref());
-                }
+            // --- concrete overloads ---
+
+            void print(const type_t& t) {
+                if (mutability::has(t.mut))
+                    os << mutability::str(t.mut) << ' ';
+                std::visit([this](const auto& v) { print_type(v); }, t.data);
             }
-            void print(const ref_expr& e) {
-                if (!e) {
-                    os << "null";
-                } else {
-                    print(e.deref());
-                }
+
+            void print(const expr_t& e) {
+                std::visit([this](const auto& v) { print_expr(v); }, e.data);
             }
-            void print(const ref_decl& d) {
-                if (!d) {
-                    os << "null";
-                } else {
-                    print(d.deref());
-                }
+
+            void print(const stmt_t& s) {
+                std::visit([this](const auto& v) { print_stmt(v); }, s.data);
             }
-            void print(const ref_stmt& s) {
-                if (!s) {
-                    os << "null";
-                } else {
-                    print(s.deref());
-                }
-            }
-            void print(const ref_stmts& ss) {
-                if (!ss) {
-                    os << "null";
-                } else {
-                    print(ss.deref());
+
+            void print(const stmts_t& s) {
+                for (const auto& stmt : s.span) {
+                    indent_line();
+                    print(stmt);
+                    os << '\n';
                 }
             }
 
-            void print(const type_t& t);
-            void print(const expr_t& e);
-            void print(const stmt_t& s);
-            void print(const stmts_t& s);
-            void print(const decl_t& d);
+            void print(const decl_t& d) {
+                std::visit([this, &d](const auto& v) { print_decl(d, v); }, d.data);
+            }
 
           private:
-            void emit_indent() {
-                for (int i = 0; i < indent_level; ++i) {
+            void indent_line() {
+                for (int i = 0; i < indent; ++i)
                     os << "    ";
+            }
+
+            template <typename Fn>
+            void indented(Fn&& fn) {
+                ++indent;
+                fn();
+                --indent;
+            }
+
+            void print_args(std::span<ref_expr> args) {
+                for (size_t i = 0; i < args.size(); ++i) {
+                    if (i)
+                        os << ", ";
+                    print(args[i]);
                 }
+            }
+
+            static constexpr std::string_view op_str(expr_var::op_e op) {
+                switch (op) {
+                case expr_var::op_e::opadd:
+                    return "+";
+                case expr_var::op_e::opsub:
+                    return "-";
+                case expr_var::op_e::opmul:
+                    return "*";
+                case expr_var::op_e::opdiv:
+                    return "/";
+                case expr_var::op_e::opand:
+                    return "&&";
+                case expr_var::op_e::opor:
+                    return "||";
+                case expr_var::op_e::opcall:
+                    return "<call>";
+                }
+            }
+
+            // --- type variants ---
+
+            void print_type(const type_var::void_t&) {
+                os << "void";
+            }
+            void print_type(const type_var::optr_t&) {
+                os << "optr";
+            }
+            void print_type(const type_var::integer_literal_t&) {
+                os << "int_literal";
+            }
+            void print_type(const type_var::float_literal_t&) {
+                os << "float_literal";
+            }
+            void print_type(const type_var::uint_t& v) {
+                os << 'u' << v.bit_size;
+            }
+            void print_type(const type_var::sint_t& v) {
+                os << 'i' << v.bit_size;
+            }
+            void print_type(const type_var::unresolved_t&) {
+                os << "<unresolved>";
+            }
+            void print_type(const type_var::type_alias_t& v) {
+                print(v.type);
+            }
+
+            template <size_t S>
+            void print_type(const type_var::fp_base<S>&) {
+                os << 'f' << S;
+            }
+
+            void print_type(const type_var::ptr_t& v) {
+                os << '*';
+                print(v.type);
+            }
+
+            void print_type(const type_var::rec_t& v) {
+                os << "rec {\n";
+                indented([&] {
+                    for (const auto& m : v.members) {
+                        indent_line();
+                        print(m);
+                        os << ";\n";
+                    }
+                });
+                indent_line();
+                os << '}';
+            }
+
+            // --- expr variants ---
+
+            void print_expr(const expr_var::int_literal_t& v) {
+                os << v.value;
+            }
+            void print_expr(const expr_var::float_literal_t& v) {
+                os << v.value;
+            }
+            void print_expr(const expr_var::bool_literal_t& v) {
+                os << (v.value ? "true" : "false");
+            }
+            void print_expr(const expr_var::unresolved_t&) {
+                os << "<unresolved>";
+            }
+
+            void print_expr(const expr_var::name_t& v) {
+                os << (v.decl ? resolve(v.decl.deref().name) : "<null>");
+            }
+
+            void print_expr(const expr_var::access_t& v) {
+                print(v.lhs);
+                os << "::";
+                print(v.rhs);
+            }
+
+            void print_expr(const expr_var::as_t& v) {
+                print(v.expr);
+                os << " as ";
+                print(v.type);
+            }
+
+            void print_expr(const expr_var::bitcast_t& v) {
+                os << "bitcast<";
+                print(v.type);
+                os << ">(";
+                print(v.expr);
+                os << ')';
+            }
+
+            void print_expr(const expr_var::rec_init_t& v) {
+                print(v.type);
+                os << "{ ";
+                print_args(v.args);
+                os << " }";
+            }
+
+            void print_expr(const expr_var::call_payload_t& v) {
+                os << '(';
+                print_args(v.args);
+                os << ')';
+            }
+
+            void print_expr(const expr_var::binary_op_t& v) {
+                os << '(';
+                print(v.lhs);
+                os << ' ' << op_str(v.op) << ' ';
+                print(v.rhs);
+                os << ')';
+            }
+
+            void print_expr(const expr_var::unary_op_t& v) {
+                if (v.op == expr_var::op_e::opcall) {
+                    print(v.operand);
+                    os << '(';
+                    print_args(v.payload.args);
+                    os << ')';
+                } else {
+                    os << op_str(v.op);
+                    print(v.operand);
+                }
+            }
+
+            void print_expr(const expr_var::block_t& v) {
+                os << "{\n";
+                indented([&] { print(v.frame.stmts); });
+                indent_line();
+                os << '}';
+            }
+
+            // --- stmt variants ---
+
+            void print_stmt(const stmt_var::decl& v) {
+                print(v.ref);
+                os << ';';
+            }
+
+            void print_stmt(const stmt_var::expr& v) {
+                print(v.ref);
+                os << ';';
+            }
+
+            void print_stmt(const stmt_var::return_t& v) {
+                os << "return";
+                if (v.val) {
+                    os << ' ';
+                    print(*v.val);
+                }
+                os << ';';
+            }
+
+            void print_stmt(const stmt_var::break_t& v) {
+                os << "break";
+                if (v.val) {
+                    os << ' ';
+                    print(*v.val);
+                }
+                os << ';';
+            }
+
+            // --- decl variants ---
+
+            void print_decl(const decl_t& d, const decl_var::var_t& v) {
+                print(v.type);
+                os << ' ' << resolve(d.name);
+                if (v.init_expr) {
+                    os << " = ";
+                    print(v.init_expr);
+                }
+            }
+
+            void print_decl(const decl_t& d, const decl_var::rec_member_t& v) {
+                os << resolve(d.name) << " : ";
+                print(v.type);
+            }
+
+            void print_decl(const decl_t& d, const decl_var::tagged_union_member_t& v) {
+                os << "variant " << resolve(d.name) << " : ";
+                print(v.type);
+            }
+
+            void print_decl(const decl_t& d, const decl_var::fn_parameter_t& v) {
+                os << resolve(d.name) << " : ";
+                print(v.type);
+            }
+
+            void print_decl(const decl_t& d, const decl_var::type_alias_t& v) {
+                os << "type " << resolve(d.name) << " = ";
+                print(v.type);
+            }
+
+            void print_decl(const decl_t& d, const decl_var::fn_t& v) {
+                os << "fn " << resolve(d.name) << '(';
+                for (size_t i = 0; i < v.args.size(); ++i) {
+                    if (i)
+                        os << ", ";
+                    print(v.args[i]);
+                }
+                os << ") -> ";
+                print(v.ret_type);
+                os << ' ';
+                print(v.body);
             }
         };
 
-        // --- Type Printer ---
-        void printer::print(const type_t& t) {
-            if (mutability::has(t.mut)) {
-                os << mutability::str(t.mut) << " ";
-            }
+        template <typename NameResolver>
+        printer(std::ostream&, NameResolver) -> printer<NameResolver>;
 
-            std::visit(
-                [this](const auto& arg) {
-                    using T = std::decay_t<decltype(arg)>;
-
-                    if constexpr (std::is_same_v<T, type_var::void_t>) {
-                        os << "void";
-                    } else if constexpr (std::is_same_v<T, type_var::optr_t>) {
-                        os << "optr";
-                    } else if constexpr (std::is_same_v<T, type_var::integer_literal_t>) {
-                        os << "int_literal";
-                    } else if constexpr (std::is_same_v<T, type_var::float_literal_t>) {
-                        os << "float_literal";
-                    } else if constexpr (std::is_same_v<T, type_var::uint_t>) {
-                        os << "u" << arg.bit_size;
-                    } else if constexpr (std::is_same_v<T, type_var::sint_t>) {
-                        os << "i" << arg.bit_size;
-                    } else if constexpr (std::is_same_v<T, type_var::f16_t> ||
-                                         std::is_same_v<T, type_var::f32_t> ||
-                                         std::is_same_v<T, type_var::f64_t> ||
-                                         std::is_same_v<T, type_var::f128_t>) {
-                        os << "f" << arg.bit_size;
-                    } else if constexpr (std::is_same_v<T, type_var::ptr_t>) {
-                        os << "*";
-                        print(arg.type);
-                    } else if constexpr (std::is_same_v<T, type_var::type_alias_t>) {
-                        print(arg.type);
-                    } else if constexpr (std::is_same_v<T, type_var::unresolved_t>) {
-                        os << "<unresolved_type>";
-                    } else if constexpr (std::is_same_v<T, type_var::rec_t>) {
-                        os << "struct {\n";
-                        indent_level++;
-                        for (const auto& member : arg.members) {
-                            emit_indent();
-                            print(member);
-                            os << ";\n";
-                        }
-                        indent_level--;
-                        emit_indent();
-                        os << "}";
-                    }
-                },
-                t.data);
-        }
-
-        // --- Expression Printer ---
-        void printer::print(const expr_t& e) {
-            std::visit(
-                [this](const auto& arg) {
-                    using T = std::decay_t<decltype(arg)>;
-
-                    if constexpr (std::is_same_v<T, expr_var::int_literal_t>) {
-                        os << arg.value;
-                    } else if constexpr (std::is_same_v<T, expr_var::float_literal_t>) {
-                        os << arg.value;
-                    } else if constexpr (std::is_same_v<T, expr_var::bool_literal_t>) {
-                        os << (arg.value ? "true" : "false");
-                    } else if constexpr (std::is_same_v<T, expr_var::name_t>) {
-                        os << (arg.decl ? name_resolver(arg.decl.deref().name)
-                                        : "<null_name>");
-                    } else if constexpr (std::is_same_v<T, expr_var::rec_access_t>) {
-                        os << "."
-                           << (arg.decl ? name_resolver(arg.decl.deref().name)
-                                        : "<null_field>");
-                    } else if constexpr (std::is_same_v<T, expr_var::unresolved_t>) {
-                        os << "<unresolved_expr>";
-                    } else if constexpr (std::is_same_v<T, expr_var::as_t>) {
-                        print(arg.expr);
-                        os << " as ";
-                        print(arg.type);
-                    } else if constexpr (std::is_same_v<T, expr_var::bitcast_t>) {
-                        os << "bitcast<";
-                        print(arg.type);
-                        os << ">(";
-                        print(arg.expr);
-                        os << ")";
-                    } else if constexpr (std::is_same_v<T, expr_var::rec_init_t>) {
-                        print(arg.type);
-                        os << "{ ";
-                        for (size_t i = 0; i < arg.args.size(); ++i) {
-                            print(arg.args[i]);
-                            if (i + 1 < arg.args.size())
-                                os << ", ";
-                        }
-                        os << " }";
-                    } else if constexpr (std::is_same_v<T, expr_var::call_payload_t>) {
-                        os << "(";
-                        for (size_t i = 0; i < arg.args.size(); ++i) {
-                            print(arg.args[i]);
-                            if (i + 1 < arg.args.size())
-                                os << ", ";
-                        }
-                        os << ")";
-                    } else if constexpr (std::is_same_v<T, expr_var::binary_op_t>) {
-                        std::string_view op_str;
-                        switch (arg.op) {
-                        case expr_var::op_e::opaccess:
-                            op_str = "::";
-                            break;
-                        case expr_var::op_e::opadd:
-                            op_str = " + ";
-                            break;
-                        case expr_var::op_e::opsub:
-                            op_str = " - ";
-                            break;
-                        case expr_var::op_e::opmul:
-                            op_str = " * ";
-                            break;
-                        case expr_var::op_e::opdiv:
-                            op_str = " / ";
-                            break;
-                        case expr_var::op_e::opand:
-                            op_str = " && ";
-                            break;
-                        case expr_var::op_e::opor:
-                            op_str = " || ";
-                            break;
-                        default:
-                            op_str = " <op> ";
-                            break;
-                        }
-                        os << "(";
-                        print(arg.lhs);
-                        os << op_str;
-                        print(arg.rhs);
-                        os << ")";
-                    } else if constexpr (std::is_same_v<T, expr_var::unary_op_t>) {
-                        if (arg.op == expr_var::op_e::opcall) {
-                            print(arg.operand);
-                            os << "(";
-                            for (size_t i = 0; i < arg.payload.args.size(); ++i) {
-                                print(arg.payload.args[i]);
-                                if (i + 1 < arg.payload.args.size())
-                                    os << ", ";
-                            }
-                            os << ")";
-                        } else {
-                            os << "<unary_op>";
-                        }
-                    } else if constexpr (std::is_same_v<T, expr_var::block_t>) {
-                        os << "{\n";
-                        indent_level++;
-                        print(arg.frame.stmts);
-                        indent_level--;
-                        emit_indent();
-                        os << "}";
-                    }
-                },
-                e.data);
-        }
-
-        // --- Statement Printer ---
-        void printer::print(const stmt_t& s) {
-            std::visit(
-                [this](const auto& arg) {
-                    using T = std::decay_t<decltype(arg)>;
-
-                    if constexpr (std::is_same_v<T, stmt_var::decl>) {
-                        print(arg.ref);
-                        os << ";";
-                    } else if constexpr (std::is_same_v<T, stmt_var::expr>) {
-                        print(arg.ref);
-                        os << ";";
-                    } else if constexpr (std::is_same_v<T, stmt_var::return_t>) {
-                        os << "return";
-                        if (arg.val) {
-                            os << " ";
-                            print(*arg.val);
-                        }
-                        os << ";";
-                    } else if constexpr (std::is_same_v<T, stmt_var::break_t>) {
-                        os << "break";
-                        if (arg.val) {
-                            os << " ";
-                            print(*arg.val);
-                        }
-                        os << ";";
-                    } else if constexpr (std::is_same_v<T, stmt_var::loop_t>) {
-                        os << "loop (cond: ";
-                        print(arg.cond);
-                        os << ", incr: ";
-                        print(arg.incr);
-                        os << ")";
-                    }
-                },
-                s.data);
-        }
-
-        void printer::print(const stmts_t& s) {
-            for (const auto& stmt : s.span) {
-                emit_indent();
-                print(stmt);
-                os << "\n";
-            }
-        }
-
-        // --- Declaration Printer ---
-        void printer::print(const decl_t& d) {
-            std::visit(
-                [this, &d](const auto& arg) {
-                    using T = std::decay_t<decltype(arg)>;
-
-                    if constexpr (std::is_same_v<T, decl_var::var_t>) {
-                        print(arg.type);
-                        os << " " << name_resolver(d.name);
-                        if (arg.init_expr) {
-                            os << " = ";
-                            print(arg.init_expr);
-                        }
-                    } else if constexpr (std::is_same_v<T, decl_var::rec_member_t>) {
-                        os << name_resolver(d.name) << " : ";
-                        print(arg.type);
-                    } else if constexpr (std::
-                                             is_same_v<T,
-                                                       decl_var::tagged_union_member_t>) {
-                        os << "variant " << name_resolver(d.name) << " : ";
-                        print(arg.type);
-                    } else if constexpr (std::is_same_v<T, decl_var::fn_parameter_t>) {
-                        os << name_resolver(d.name) << " : ";
-                        print(arg.type);
-                    } else if constexpr (std::is_same_v<T, decl_var::type_alias_t>) {
-                        os << "type " << name_resolver(d.name) << " = ";
-                        print(arg.type);
-                    } else if constexpr (std::is_same_v<T, decl_var::fn_t>) {
-                        os << "fn " << name_resolver(d.name) << "(";
-                        for (size_t i = 0; i < arg.args.size(); ++i) {
-                            // Prints parameters as definitions inside signature
-                            print(arg.args[i]);
-                            if (i + 1 < arg.args.size())
-                                os << ", ";
-                        }
-                        os << ") -> ";
-                        print(arg.ret_type);
-                        os << " ";
-                        print(arg.body);
-                    }
-                },
-                d.data);
-        }
     } // namespace SLOP
-
     template <typename T>
     struct is_ref : std::false_type {};
     template <typename T>
@@ -2796,7 +2835,6 @@ namespace ast {
     inline constexpr bool is_optional_of_ref_v = is_optional_of_ref<T>::value;
 
     namespace walker {
-
         template <typename Derived>
         struct t {
 
@@ -2817,6 +2855,10 @@ namespace ast {
                         for (auto& elm : field) {
                             visit(elm);
                         }
+                    } else if constexpr (requires(T t) {
+                                             { t.frame } -> std::same_as<util::frame&>;
+                                         }) {
+                        visit(field.stmts);
                     }
                 });
             }
@@ -2841,9 +2883,18 @@ namespace ast {
     } // namespace walker
 
     struct Resolver : walker::t<Resolver> {
-        ref_scope scope;
         std::flat_set<void*> resolving;
         std::vector<ref_scope> scopes;
+
+        void resolve_name_expr(ref_scope scope, ref_expr expr, expr_var::unresolved_t u) {
+            const auto lookup = scope_t::ancestor_lookup(scope, u.name.name);
+
+            if (!lookup) {
+                throw std::runtime_error("Failed to find symbol");
+            }
+            const auto& result = lookup.value();
+            std::println("found symbol {}", result.symbol.as_void());
+        }
 
         void insert(void* ptr) {
             if (resolving.contains(ptr))
@@ -2851,6 +2902,7 @@ namespace ast {
 
             resolving.insert(ptr);
         }
+
         void remove(void* ptr) {
             if (!resolving.contains(ptr))
                 throw std::runtime_error("Attempted to erase non existant entry");
@@ -2858,34 +2910,114 @@ namespace ast {
             resolving.erase(ptr);
         }
 
-        void entry(ref_decl ptr, decl_var::type_alias_t& v) {}
-
-        void entry(ref_expr ptr, expr_var::binary_op_t& v) {
-            if (v.op == expr_var::op_e::opaccess) {
-                // lhs should provide the scope when resolving rhs
-                auto lhs = [&] { auto ptr = v.lhs; };
-                auto rhs = [&] { auto ptr = v.rhs; };
-            }
+        void insert_scope(ref_scope scope) {
+            std::println("scope::{} with parent::{}",
+                         scope.as_void(),
+                         scope.deref().parent.as_void());
+            scopes.push_back(scope);
         }
-        void exit(ref_expr ptr, expr_var::binary_op_t& v) {
-            if (v.op == expr_var::op_e::opaccess) {
-                // lhs should provide the scope when resolving rhs
-            }
+        void pop_scope() {
+            scopes.pop_back();
         }
-        // void entry(ref_expr ptr, expr_var::unresolved_t& v) {
-        //     insert(ptr.as_void());
+        ref_scope back_scope() {
+            return scopes.back();
+        }
 
-        //     std::println("Resolving range id={}", v.name.name);
+        void entry(ref_expr ptr, expr_var::access_t& v) {
+            visit(v.lhs);
+        }
 
-        //     remove(ptr.as_void());
-        // }
+        void entry(ref_expr ptr, expr_var::unresolved_t& v) {
+            insert(ptr.as_void());
+            std::println("unresolved expr :: id_{}", v.name.name);
+            remove(ptr.as_void());
+        }
+
+        template <bool local = false>
+        ref_decl resolve_type_chain(cursor& c, const cursor& end, ref_scope scope) {
+            if (c.cursor == end.cursor)
+                throw_error("Empty type chain");
+
+            const auto& n = c++.get();
+
+            if (!n.isa(final::ID)) [[unlikely]]
+                throw_error(
+                    std::format("Expected ID in type chain, got {}", lexer::str(n)));
+
+            const auto id = n.unsafe_final().data;
+
+            constexpr auto lookup_fn =
+                local ? scope_t::local_lookup : scope_t::ancestor_lookup;
+            auto lookup = lookup_fn(scope, id);
+
+            if (!lookup)
+                throw_error(std::format("Unknown type symbol"));
+
+            const auto result = lookup->symbol;
+
+            // consume :: if present
+            if (c.cursor != end.cursor) {
+                if (!c.get().isa(final::DCOLON)) [[unlikely]] {
+                    throw_error(
+                        std::format("Expected '::' after ID in type chain, got {}",
+                                    lexer::str(c.get())));
+                }
+                c++;
+
+                if (c.cursor == end.cursor) [[unlikely]]
+                    throw_error("Trailing '::' in type chain");
+
+                // recurse into the scope of the resolved decl, local from here on
+                return resolve_type_chain<true>(c, end, scope_of_decl(result));
+            }
+
+            return result;
+        }
 
         void entry(ref_type ptr, type_var::unresolved_t& v) {
             insert(ptr.as_void());
-            std::println("Resolving range={}-{}",
-                         (void*)v.data.begin.cursor,
-                         (void*)v.data.end.cursor);
+
+            auto c = v.data.begin;
+            const auto result = resolve_type_chain(c, v.data.end, scopes.back());
+
+            if (!result)
+                throw_error("Empty type chain");
+
+            auto resolved_type = [&]() {
+                const auto* alias =
+                    std::get_if<decl_var::type_alias_t>(&result.deref().data);
+                if (alias) {
+                    return std::optional{std::cref(alias->type)};
+                }
+                return decltype(std::optional{std::cref(alias->type)}){};
+            }();
+
+            if (const auto& rt = resolved_type) {
+                ptr.deref().data = type_var::type_alias_t{rt.value()};
+            } else {
+                throw_error("Expected a type declaration");
+            }
+
             remove(ptr.as_void());
+        }
+
+        void entry(ref_decl ptr, decl_var::fn_t& v) {
+            insert_scope(v.scope);
+        }
+        void exit(ref_decl ptr, decl_var::fn_t& v) {
+            pop_scope();
+        }
+        void entry(ref_expr ptr, expr_var::block_t& v) {
+            insert_scope(v.frame.scope);
+        }
+        void exit(ref_expr ptr, expr_var::block_t& v) {
+            pop_scope();
+        }
+        void entry(ref_type ptr, type_var::rec_t& v) {
+            insert_scope(v.scope);
+        }
+        void exit(ref_type ptr, type_var::rec_t& v) {
+            pop_scope();
         }
 
         void entry(auto ptr, auto& v) {}
@@ -2906,6 +3038,7 @@ namespace ast {
         auto file = node2ast::stmts_fn(e, c);
 
         Resolver v;
+        v.scopes.push_back(scope);
         v.visit(file);
 
         return file;
@@ -3038,8 +3171,12 @@ namespace codegen {
 } // namespace codegen
 
 int main(int argc, char* argv[]) {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmParser();
+    llvm::InitializeNativeTargetAsmPrinter();
+
     if (argc < 2) {
-        std::println("usage: {} <file>", argv[0]);
+        std::println("usage: {} <file>\n", argv[0]);
         return 1;
     }
     std::string_view filepath = argv[1];
@@ -3050,10 +3187,6 @@ int main(int argc, char* argv[]) {
     }
 
     std::println("file=\"{}\"", filepath);
-
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmParser();
-    llvm::InitializeNativeTargetAsmPrinter();
 
     source src{std::string(filepath), std::move(text.value())};
     const auto lexer_output = lexer::entry(src, intern_table);
