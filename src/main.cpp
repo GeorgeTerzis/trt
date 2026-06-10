@@ -9,7 +9,9 @@
 #include "../libs/map.hpp"
 #include "../libs/meta.hpp"
 #include "../libs/ref.hpp"
+#include "../libs/staging_vec.hpp"
 #include "../libs/vector.hpp"
+#include "./mutability.hpp"
 
 #include <boost/pfr/core.hpp>
 #include <cassert>
@@ -86,44 +88,7 @@ overload(Func...) -> overload<Func...>;
 // I could eliminate this by having 2 allocators
 // 1 for temporary allocations like vectors and once they are done I copy paste them to
 // the main one and 1 for long living allocations refrences
-template <typename T>
-struct staging_vec {
-    using Allocator = llvm_allocator;
-
-    Allocator& arena;
-    llvm::SmallVector<T, 5> staging;
-
-    explicit staging_vec(llvm_allocator& a) : arena(a) {}
-
-    void push_back(const T& v) {
-        staging.push_back(v);
-    }
-    void push_back(T&& v) {
-        staging.push_back(std::move(v));
-    }
-
-    template <typename... Args>
-    T& emplace_back(Args&&... args) {
-        return staging.emplace_back(std::forward<Args>(args)...);
-    }
-
-    [[nodiscard]] std::span<T> commit() {
-        if (staging.empty())
-            return {};
-        std::span<T> result = arena.alloc_many<T>(staging.size());
-        for (std::size_t i = 0; i < staging.size(); ++i)
-            result[i] = std::move(staging[i]);
-        staging.clear();
-        return result;
-    }
-
-    std::size_t size() const {
-        return staging.size();
-    }
-    bool empty() const {
-        return staging.empty();
-    }
-};
+// do not use this as a member
 
 inline std::string source_location_to_string(
     const std::source_location& loc = std::source_location::current()) {
@@ -892,8 +857,8 @@ namespace lexer {
         return !v.empty() &&
                std::ranges::all_of(v, [](unsigned char c) { return is_digit(c); });
     }
-    auto prefixed_numeric_or_id FNSIG {
 
+    auto prefixed_numeric_or_id FNSIG {
         auto text = read_word(src, token_begin);
         cursor += text.size();
         auto loc = source_location{u.line, token_begin, cursor};
@@ -929,24 +894,25 @@ namespace lexer {
 
     auto num FNSIG {
         auto i = token_begin;
-        bool is_float = false;
+        final::e fintype = final::INT;
+
         while (i < src.size() && is_digit(static_cast<unsigned char>(src[i]))) {
             ++i;
         }
 
         if (i < src.size() && src[i] == '.') {
-            is_float = true;
+            fintype = final::FLOAT;
             ++i;
 
             while (i < src.size() && is_digit(src[i])) {
                 ++i;
             }
         }
-        if (i < src.size() && (src[i] == 'e' || src[i] == 'E')) {
-            is_float = true;
+        if (i < src.size() && (src[i] == 'e')) {
+            fintype = final::FLOAT;
             ++i;
 
-            if (i < src.size() && (src[i] == '+' || src[i] == '-'))
+            if (i < src.size() && (src[i] == '-'))
                 ++i;
 
             while (i < src.size() && is_digit(src[i]))
@@ -954,10 +920,11 @@ namespace lexer {
         }
 
         auto loc = source_location{u.line, token_begin, i};
-        u.buffer.push(node(final{is_float ? final::FLOAT : final::INT}), loc);
+        u.buffer.push(node(final{fintype}), loc);
 
         become next(u, src, i, i);
     }
+
     [[noreturn]] auto unreachable_state FNSIG {
         std::unreachable();
     }
@@ -1062,6 +1029,7 @@ namespace lexer {
 
         become next(u, src, end, end);
     }
+
     auto line_comment FNSIG {
         // disambiguate '/' (divide) vs '//' (comment)
         if (!within_src(src, cursor + 1) || src[cursor + 1] != '/') {
@@ -1264,13 +1232,20 @@ namespace ast {
             ref_scope scope;
             ref_stmts stmts;
         };
-
         struct unresolved_range {
             cursor begin;
             cursor end;
         };
         struct unresolved_name {
             intern_id name;
+        };
+
+        // consumable
+        // a record , tuple or variant builder injests it to it's type
+        // rec_field, var_field, tup_field
+        struct field_token {
+            intern_id name;
+            ref_type type;
         };
     } // namespace util
 
@@ -1280,9 +1255,19 @@ namespace ast {
             ref_expr init_expr;
         };
 
+        struct var_infer {
+            ref_expr init_expr;
+        };
+
         struct rec_member_t {
             ref_type type;
             std::uint32_t index;
+        };
+        struct var_member_t {
+            ref_type type;
+        };
+        struct tup_member_t {
+            ref_type type;
         };
 
         struct tagged_union_member_t {
@@ -1315,10 +1300,10 @@ namespace ast {
 
     namespace stmt_var {
 
-        struct decl {
+        struct decl_wrap {
             ref_decl ref;
         };
-        struct expr {
+        struct expr_wrap {
             ref_expr ref;
         };
 
@@ -1335,7 +1320,7 @@ namespace ast {
             std::optional<ref_expr> val;
         };
 
-        using variant = std::variant<decl, expr, return_t, break_t>;
+        using variant = std::variant<decl_wrap, expr_wrap, return_t, break_t>;
     } // namespace stmt_var
 
     struct stmt_t {
@@ -1492,80 +1477,6 @@ namespace ast {
         expr_var::variant data;
     };
 
-    namespace mutability {
-        enum internal_e : std::int8_t {
-            CONSTANT = 0,
-            IMMUTABLE = 1,
-            MUTABLE = 2,
-            NONE = 3
-        };
-
-        struct t {
-            mutability::internal_e value;
-
-            constexpr t() noexcept : value(NONE) {}
-            constexpr t(const mutability::internal_e v) noexcept : value(v) {}
-        };
-
-        [[nodiscard]] constexpr bool has(const t v) {
-            return v.value != NONE;
-        }
-        [[nodiscard]] constexpr bool is_none(const t v) {
-            return v.value == NONE;
-        }
-        [[nodiscard]] constexpr bool is_mut(const t v) {
-            return v.value == MUTABLE;
-        }
-        [[nodiscard]] constexpr bool is_imut(const t v) {
-            return v.value == IMMUTABLE;
-        }
-        [[nodiscard]] constexpr bool is_const(const t v) {
-            return v.value == CONSTANT;
-        }
-
-        [[nodiscard]] constexpr t ifnone(const t v, const t then) {
-            if (is_none(v))
-                return then;
-            return v;
-        }
-
-        [[nodiscard]] constexpr bool eq(const t lhs, const t rhs) {
-            if (lhs.value == rhs.value)
-                return true;
-
-            const t L = ifnone(lhs, rhs);
-            const t R = ifnone(rhs, lhs);
-
-            return L.value == R.value;
-        }
-
-        [[nodiscard]] constexpr static std::string_view str(const t val) {
-            switch (val.value) {
-            case NONE:
-                return "none";
-            case CONSTANT:
-                return "constant";
-            case IMMUTABLE:
-                return "immutable";
-            case MUTABLE:
-                return "mutable";
-            }
-        }
-
-        [[nodiscard]] constexpr static mutability::t constant() {
-            return CONSTANT;
-        }
-        [[nodiscard]] constexpr static mutability::t mut() {
-            return MUTABLE;
-        }
-        [[nodiscard]] constexpr static mutability::t imut() {
-            return IMMUTABLE;
-        }
-        [[nodiscard]] constexpr static mutability::t none() {
-            return NONE;
-        }
-    }; // namespace mutability
-
     namespace type_var {
         struct uint_t {
             size_t bit_size;
@@ -1634,10 +1545,11 @@ namespace ast {
         decl_var::variant data;
     };
 
+    struct type_eq_default_policy {
+        static constexpr bool ignore_mutability = false;
+    };
+    template <typename Policy = type_eq_default_policy>
     struct type_eq {
-        struct policy {
-            static constexpr bool ignore_mutability = false;
-        };
 
         using trivially_true = type_list<type_var::void_t,
                                          type_var::optr_t,
@@ -1650,7 +1562,6 @@ namespace ast {
 
         using numeric_cat = type_list<type_var::uint_t, type_var::sint_t>;
 
-        template <typename Policy = policy>
         static bool eq(const ref_type& a, const ref_type& b) {
             if (a == b)
                 return true;
@@ -1659,7 +1570,6 @@ namespace ast {
             return eq<Policy>(a.deref(), b.deref());
         }
 
-        template <typename Policy = policy>
         static bool eq(const type_t& a, const type_t& b) {
             return std::visit(
                 [](const auto& x, const auto& y) { return eq_impl<Policy>(x, y); },
@@ -1669,33 +1579,29 @@ namespace ast {
 
       private:
         // default: different types
-        template <typename Policy, typename A, typename B>
+        template <typename A, typename B>
         static bool eq_impl(const A&, const B&) {
             return false;
         }
 
         // trivially true
-        template <typename Policy, typename T>
+        template <typename T>
             requires is_in_list<T, trivially_true>::value
         static constexpr bool eq_impl(const T&, const T&) {
             return true;
         }
 
         // numeric: compare size
-        template <typename Policy, typename T>
+        template <typename T>
             requires is_in_list<T, numeric_cat>::value
         static bool eq_impl(const T& a, const T& b) {
             return a.bit_size == b.bit_size;
         }
 
-        // ptr: recurse
-        template <typename Policy>
         static bool eq_impl(const type_var::ptr_t& a, const type_var::ptr_t& b) {
             return eq<Policy>(a.type, b.type);
         }
 
-        // rec: structural
-        template <typename Policy>
         static bool eq_impl(const type_var::rec_t& a, const type_var::rec_t& b) {
             if (a.members.size() != b.members.size())
                 return false;
@@ -1793,8 +1699,9 @@ namespace ast {
         return mem;
     }
 
-    ref_scope scope_of_type(const ref_type& t);
-    ref_scope scope_of_decl(const ref_decl& d);
+    ref_scope scope_of_type(const ref_type& ptr);
+    ref_scope scope_of_decl(const ref_decl& ptr);
+    ref_scope scope_of_expr(const ref_expr& ptr);
 
     ref_scope scope_of(const type_var::rec_t& v) {
         return v.scope;
@@ -1813,11 +1720,19 @@ namespace ast {
         throw_error(std::format("Cannot get scope of type {}", type_str<T>()));
     }
 
-    ref_scope scope_of_type(const ref_type& t) {
-        return std::visit([](const auto& v) { return scope_of(v); }, t.deref().data);
+    ref_scope scope_of_expr(const ref_expr& ptr) {
+        return std::visit(
+            overload{[](const expr_var::name_t& v) { return scope_of_decl(v.decl); },
+                     [](auto& v) -> ref_scope {
+                         throw_error("Can't get scope from this expresion");
+                     }},
+            ptr.deref().data);
+    }
+    ref_scope scope_of_type(const ref_type& ptr) {
+        return std::visit([](const auto& v) { return scope_of(v); }, ptr.deref().data);
     }
 
-    ref_scope scope_of_decl(const ref_decl& d) {
+    ref_scope scope_of_decl(const ref_decl& ptr) {
         return std::visit(
             overload{
                 [](const decl_var::type_alias_t& v) { return scope_of_type(v.type); },
@@ -1825,7 +1740,20 @@ namespace ast {
                     throw_error("Cannot get scope of non-type decl");
                 },
             },
-            d.deref().data);
+            ptr.deref().data);
+    }
+
+    decl_var::rec_member_t rec_field_val(const auto index, const util::field_token f) {
+        return {
+            .type = f.type,
+            .index = index,
+        };
+    }
+
+    ref_decl rec_field(env e, const auto index, const util::field_token f) {
+        auto ptr = alloc_and_insert_decl(e, f.name);
+        ptr.deref().data = rec_field_val(index, f);
+        return ptr;
     }
 
     namespace node2ast {
@@ -1973,6 +1901,14 @@ namespace ast {
         ref_expr expr_fn(env e, cursor& c, int min_prec = 0);
         ref_stmts stmts_fn(env e, cursor& c);
 
+        util::field_token field_token(env e, cursor& c) {
+            const auto& name_fin = c++.get().as_final().value().get();
+            const auto name = name_fin.data;
+            expect_node<final::COLON>(c++.get());
+            const auto type = type_fn(e, c);
+            return {name, type};
+        }
+
         namespace expr_patterns {
 
             namespace operands {
@@ -2118,7 +2054,7 @@ namespace ast {
                 }
 
                 ref_expr infix(env e, cursor& c, ref_expr lhs, expr_var::op_e op) {
-                    c++; // consume operator token
+                    c++;
                     const auto meta = expr_var::op_meta(op);
                     ref_expr rhs = expr_fn(e, c, expr_var::right_bp(meta));
                     return make_expr(e,
@@ -2166,19 +2102,6 @@ namespace ast {
             return lhs;
         }
 
-        ref_decl member_decl(env e, cursor& c, std::uint32_t i) {
-            auto& name_node = c++.get();
-            auto name = name_node.unsafe_final().data;
-
-            auto ptr = alloc_and_insert_decl(e, name);
-            expect_node<final::COLON>(c++.get());
-            const auto type = type_fn(e, c);
-
-            ptr.deref().data = decl_var::rec_member_t{.type = type, .index = i};
-
-            return ptr;
-        }
-
         namespace type_patterns {
             type_var::rec_t rec(env e, cursor& c) {
                 c++;
@@ -2192,19 +2115,10 @@ namespace ast {
                 auto staging = staging_vec<ref_decl>(e.allocator);
                 median_loop(e.with(scope), members, [&staging](env e, cursor& c) -> void {
                     const auto index = static_cast<std::uint32_t>(staging.size());
-                    const auto mem =
-                        path_switch<ref_decl>(c)
-                            .path<final::ID, final::COLON>(member_decl, e, c, index)
-                            .def(
-                                [](env e, cursor& c, std::uint32_t i) -> ref_decl {
-                                    throw_error("Expected member declaration "
-                                                "found something else");
-                                },
-                                e,
-                                c,
-                                index);
+                    const auto token = field_token(e, c);
+                    const auto m = rec_field(e, index, token);
 
-                    staging.push_back(mem);
+                    staging.push_back(m);
                 });
                 c++;
 
@@ -2451,11 +2365,11 @@ namespace ast {
 
             stmt_var::variant decl_stmt_fn(env e, cursor& c) {
                 auto decl = decl_fn(e, c);
-                return stmt_var::decl{decl};
+                return stmt_var::decl_wrap{decl};
             }
 
             stmt_var::variant expr_stmt_fn(env e, cursor& c) {
-                return stmt_var::expr{expr_fn(e, c)};
+                return stmt_var::expr_wrap{expr_fn(e, c)};
             }
         } // namespace stmt_patterns
 
@@ -2490,8 +2404,9 @@ namespace ast {
 
     // Devilish
     //  I kinda like it but at the same time I hate it
-    //  WHY USE STD::FUNCTION TO RESOLVE AND NOT PASS THE Unit or whatever other context?
-    //  it works though so it is what it is who gives a cares about the printer
+    //  WHY USE STD::FUNCTION TO RESOLVE AND NOT PASS THE Unit or whatever other
+    //  context? it works though so it is what it is who gives a cares about the
+    //  printer
     // maybe not what i had hopped from the MachineGod gemmini to give me back
     // hard coding the operators is diaboloical
     // this thing will be a nihtmare to update
@@ -2729,12 +2644,12 @@ namespace ast {
 
             // --- stmt variants ---
 
-            void print_stmt(const stmt_var::decl& v) {
+            void print_stmt(const stmt_var::decl_wrap& v) {
                 print(v.ref);
                 os << ';';
             }
 
-            void print_stmt(const stmt_var::expr& v) {
+            void print_stmt(const stmt_var::expr_wrap& v) {
                 print(v.ref);
                 os << ';';
             }
@@ -2925,11 +2840,48 @@ namespace ast {
 
         void entry(ref_expr ptr, expr_var::access_t& v) {
             visit(v.lhs);
+            auto scope = scope_of_type(v.lhs.deref().type);
+            if (!scope) {
+                throw_error("Expected symbol to have a scope");
+            }
+            this->insert_scope(scope);
+            visit(v.rhs);
         }
 
         void entry(ref_expr ptr, expr_var::unresolved_t& v) {
             insert(ptr.as_void());
             std::println("unresolved expr :: id_{}", v.name.name);
+
+            auto scope = this->back_scope();
+
+            // needs some kind of scoping we can't really go around just resolving like
+            // this
+            //  if this get's hit by something that is part of an access then  we use the
+            //  right scope but the wrong lookup function
+            auto lookup = scope_t::ancestor_lookup(scope, v.name.name);
+            if (!lookup) [[unlikely]]
+                throw_error("Expected expresion name lookup to resolve");
+
+            auto& lookupv = lookup.value();
+            ptr.deref().data = expr_var::name_t{lookupv.symbol};
+
+            // this probably needs to be expanded upon
+            // I might try to automate this slightly so I do not have to manually write
+            // every visitor.
+            // But it works for <name>::<something> not for ()::<something>
+            // since we need to deduce it's type
+
+            ref_type type = std::visit(
+                overload{
+                    [&](decl_var::var_t& var) -> ref_type { return var.type; },
+                    [&](decl_var::rec_member_t& var) -> ref_type { return var.type; },
+                    [](auto& val) -> ref_type {
+                        throw_error("Expected this to resolve to a variable");
+                    }},
+                lookupv.symbol.deref().data);
+
+            ptr.deref().type = type;
+
             remove(ptr.as_void());
         }
 
@@ -2948,6 +2900,7 @@ namespace ast {
 
             constexpr auto lookup_fn =
                 local ? scope_t::local_lookup : scope_t::ancestor_lookup;
+
             auto lookup = lookup_fn(scope, id);
 
             if (!lookup)
@@ -2967,8 +2920,8 @@ namespace ast {
                 if (c.cursor == end.cursor) [[unlikely]]
                     throw_error("Trailing '::' in type chain");
 
-                // recurse into the scope of the resolved decl, local from here on
-                return resolve_type_chain<true>(c, end, scope_of_decl(result));
+                auto next_scope = scope_of_decl(result);
+                return resolve_type_chain<true>(c, end, next_scope);
             }
 
             return result;
@@ -3168,6 +3121,178 @@ namespace codegen {
             module().print(llvm::outs(), nullptr);
         }
     };
+
+    using value_cache = std::flat_map<void*, llvm::Value*>;
+
+    llvm::Type* gen_type(unit& u, const ast::ref_type& ref);
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::ref_expr& ref);
+    void gen_stmt(unit& u, value_cache& cache, const ast::ref_stmt& ref);
+    void gen_decl(unit& u, value_cache& cache, const ast::ref_decl& ref);
+
+    llvm::Type* gen_type(unit& u, const ast::type_var::void_t&) {
+        return llvm::Type::getVoidTy(u.context());
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::uint_t& t) {
+        return llvm::IntegerType::get(u.context(), t.bit_size);
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::sint_t& t) {
+        return llvm::IntegerType::get(u.context(), t.bit_size);
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::f16_t&) {
+        return llvm::Type::getHalfTy(u.context());
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::f32_t&) {
+        return llvm::Type::getFloatTy(u.context());
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::f64_t&) {
+        return llvm::Type::getDoubleTy(u.context());
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::f128_t&) {
+        return llvm::Type::getFP128Ty(u.context());
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::optr_t&) {
+        return llvm::PointerType::getUnqual(u.context());
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::ptr_t&) {
+        return llvm::PointerType::getUnqual(u.context());
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::integer_literal_t&) {
+        return llvm::IntegerType::get(u.context(), 64);
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::float_literal_t&) {
+        return llvm::Type::getDoubleTy(u.context());
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::type_alias_t& t) {
+        return gen_type(u, t.type);
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::unresolved_t&) {
+        throw_error("unresolved type in codegen");
+    }
+    llvm::Type* gen_type(unit& u, const ast::type_var::rec_t& t) {
+        auto fields = u.allocator().alloc_many<llvm::Type*>(t.members.size());
+        for (size_t i = 0; i < t.members.size(); ++i) {
+            const auto& m =
+                std::get<ast::decl_var::rec_member_t>(t.members[i].deref().data);
+            fields[i] = gen_type(u, m.type);
+        }
+        return llvm::StructType::get(
+            u.context(),
+            llvm::ArrayRef<llvm::Type*>(fields.data(), fields.size()));
+    }
+
+    llvm::Type* gen_type(unit& u, const ast::type_t& t) {
+        return std::visit([&](const auto& v) { return gen_type(u, v); }, t.data);
+    }
+    llvm::Type* gen_type(unit& u, const ast::ref_type& ref) {
+        return gen_type(u, ref.deref());
+    }
+
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::int_literal_t& v) {
+        return nullptr;
+    }
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::float_literal_t& v) {
+        return nullptr;
+    }
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::bool_literal_t& v) {
+        return nullptr;
+    }
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::binary_op_t& v) {
+        return nullptr;
+    }
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::unary_op_t& v) {
+        return nullptr;
+    }
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::name_t& v) {
+        return nullptr;
+    }
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::block_t& v) {
+        return nullptr;
+    }
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::rec_init_t& v) {
+        return nullptr;
+    }
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::as_t& v) {
+        return nullptr;
+    }
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::bitcast_t& v) {
+        return nullptr;
+    }
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::access_t& v) {
+        return nullptr;
+    }
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::call_payload_t& v) {
+        return nullptr;
+    }
+    llvm::Value*
+    gen_expr(unit& u, value_cache& cache, const ast::expr_var::unresolved_t&) {
+        throw_error("unresolved expr in codegen");
+    }
+
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_t& e) {
+        return std::visit([&](const auto& v) { return gen_expr(u, cache, v); }, e.data);
+    }
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::ref_expr& ref) {
+        return gen_expr(u, cache, ref.deref());
+    }
+
+    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_var::decl_wrap& v) {}
+    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_var::expr_wrap& v) {}
+    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_var::return_t& v) {}
+    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_var::break_t& v) {}
+
+    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_t& s) {
+        std::visit([&](const auto& v) { gen_stmt(u, cache, v); }, s.data);
+    }
+    void gen_stmt(unit& u, value_cache& cache, const ast::ref_stmt& ref) {
+        gen_stmt(u, cache, ref.deref());
+    }
+
+    void gen_decl(unit& u,
+                  value_cache& cache,
+                  const ast::decl_t&,
+                  const ast::decl_var::fn_t&) {}
+    void gen_decl(unit& u,
+                  value_cache& cache,
+                  const ast::decl_t&,
+                  const ast::decl_var::var_t&) {}
+    void gen_decl(unit& u,
+                  value_cache& cache,
+                  const ast::decl_t&,
+                  const ast::decl_var::type_alias_t&) {}
+    void gen_decl(unit& u,
+                  value_cache& cache,
+                  const ast::decl_t&,
+                  const ast::decl_var::rec_member_t&) {}
+    void gen_decl(unit& u,
+                  value_cache& cache,
+                  const ast::decl_t&,
+                  const ast::decl_var::fn_parameter_t&) {}
+    void gen_decl(unit& u,
+                  value_cache& cache,
+                  const ast::decl_t&,
+                  const ast::decl_var::tagged_union_member_t&) {}
+
+    void gen_decl(unit& u, value_cache& cache, const ast::decl_t& d) {
+        std::visit([&](const auto& v) { gen_decl(u, cache, d, v); }, d.data);
+    }
+    void gen_decl(unit& u, value_cache& cache, const ast::ref_decl& ref) {
+        gen_decl(u, cache, ref.deref());
+    }
+
+    void entry(unit& u, const ast::ref_stmts& stmts) {
+        value_cache cache;
+        for (const auto& stmt : stmts.deref().span)
+            gen_stmt(u, cache, stmt);
+    }
+
 } // namespace codegen
 
 int main(int argc, char* argv[]) {
@@ -3179,8 +3304,10 @@ int main(int argc, char* argv[]) {
         std::println("usage: {} <file>\n", argv[0]);
         return 1;
     }
+
     std::string_view filepath = argv[1];
     lexer::intern_table intern_table;
+
     auto text = load_file(filepath);
     if (!text) [[unlikely]] {
         throw std::runtime_error(text.error());
@@ -3204,6 +3331,11 @@ int main(int argc, char* argv[]) {
         auto slpp = ast::SLOP::printer(std::cerr);
         slpp.print(file);
     }
-    auto llvm_unit = codegen::unit(filepath);
+    {
+        auto llvm_unit = codegen::unit(filepath);
+
+        // codegen::gen_type(llvm_unit, );
+    }
+
     return 0;
 }
