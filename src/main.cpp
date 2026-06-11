@@ -2001,7 +2001,11 @@ namespace ast {
                             .path<final::TRUE>(bool_true, e, c)
                             .path<final::FALSE>(bool_false, e, c)
                             .path<final::ID>(can_chain<single_id>, e, c)
-                            .path<median::PARENS>(can_chain<block>, e, c)
+                            .path<median::PARENS>(
+                                block,
+                                e,
+                                c) // solution to the problems that come from chaining, I
+                                   // might bring it back in the future
                             .def(
                                 [](env e, cursor& c) -> expr_var::variant {
                                     throw_error(std::format("Expected operand, got {}",
@@ -2801,16 +2805,6 @@ namespace ast {
         std::flat_set<void*> resolving;
         std::vector<ref_scope> scopes;
 
-        void resolve_name_expr(ref_scope scope, ref_expr expr, expr_var::unresolved_t u) {
-            const auto lookup = scope_t::ancestor_lookup(scope, u.name.name);
-
-            if (!lookup) {
-                throw std::runtime_error("Failed to find symbol");
-            }
-            const auto& result = lookup.value();
-            std::println("found symbol {}", result.symbol.as_void());
-        }
-
         void insert(void* ptr) {
             if (resolving.contains(ptr))
                 throw std::runtime_error("Recursive resolution attempted");
@@ -2826,9 +2820,9 @@ namespace ast {
         }
 
         void insert_scope(ref_scope scope) {
-            std::println("scope::{} with parent::{}",
-                         scope.as_void(),
-                         scope.deref().parent.as_void());
+            // std::println("scope::{} with parent::{}",
+            //              scope.as_void(),
+            //              scope.deref().parent.as_void());
             scopes.push_back(scope);
         }
         void pop_scope() {
@@ -2840,6 +2834,7 @@ namespace ast {
 
         void entry(ref_expr ptr, expr_var::access_t& v) {
             visit(v.lhs);
+            visit(v.lhs.deref().type);
             auto scope = scope_of_type(v.lhs.deref().type);
             if (!scope) {
                 throw_error("Expected symbol to have a scope");
@@ -2848,9 +2843,12 @@ namespace ast {
             visit(v.rhs);
         }
 
+        void exit(ref_expr ptr, expr_var::access_t& v) {
+            pop_scope();
+        }
+
         void entry(ref_expr ptr, expr_var::unresolved_t& v) {
             insert(ptr.as_void());
-            std::println("unresolved expr :: id_{}", v.name.name);
 
             auto scope = this->back_scope();
 
@@ -2862,8 +2860,8 @@ namespace ast {
             if (!lookup) [[unlikely]]
                 throw_error("Expected expresion name lookup to resolve");
 
-            auto& lookupv = lookup.value();
-            ptr.deref().data = expr_var::name_t{lookupv.symbol};
+            auto& lv = lookup.value();
+            ptr.deref().data = expr_var::name_t{lv.symbol};
 
             // this probably needs to be expanded upon
             // I might try to automate this slightly so I do not have to manually write
@@ -2875,10 +2873,11 @@ namespace ast {
                 overload{
                     [&](decl_var::var_t& var) -> ref_type { return var.type; },
                     [&](decl_var::rec_member_t& var) -> ref_type { return var.type; },
+                    [&](decl_var::fn_parameter_t& var) -> ref_type { return var.type; },
                     [](auto& val) -> ref_type {
                         throw_error("Expected this to resolve to a variable");
                     }},
-                lookupv.symbol.deref().data);
+                lv.symbol.deref().data);
 
             ptr.deref().type = type;
 
@@ -2953,6 +2952,8 @@ namespace ast {
 
             remove(ptr.as_void());
         }
+
+        void exit(ref_type ptr, type_var::unresolved_t& v) {}
 
         void entry(ref_decl ptr, decl_var::fn_t& v) {
             insert_scope(v.scope);
