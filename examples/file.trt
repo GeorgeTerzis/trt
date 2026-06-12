@@ -1,21 +1,26 @@
 // a simple dynamic array arena
-// arena: @type @rec(
-//     capacity: usize;
-//     length: usize;
-//     data: opaque;
-// );
+arena: @type @rec(
+    capacity: usize;
+    length: usize;
+    data: opaque;
+);
 
 
-// arena_init: @fn(capacity: s32) arena = (
-//     // length: s32 = 0;
-//     // data: opaque = cmalloc(capacity);
-//     ret @(arena)(capacity; length; data);
-// );
+cmalloc: @fn(alignment: usize; size: usize) opaque = 0;
+
+arena_init: @fn(capacity: s32) arena = (
+ length: s32 = 0;
+ data: opaque = cmalloc(capacity);
+ ret @(arena)(capacity; length; data);
+);
 
 // arena_new: @fn(capacity: usize) arena = arena_init(capacity);
 // arena_alloc: @fn(a: *arena; size: usize; align: usize) opaque = arena_alloc_impl(a; size; align);
-// arena_len: @fn(a: *arena) usize = a::length;
-// arena_is_full: @fn(a: *arena) usize = a::length and a::capacity;
+arena_len: @fn(a: *arena) usize = a::length;
+arena_is_full: @fn(a: *arena) usize = a::length and a::capacity;
+
+b: B = 0;
+c: D = b::mem1::mem0;
 
 B: @type @rec(
     mem0: s32;
@@ -27,11 +32,17 @@ A: @type @rec(
   mem1: s32;
 );
 
-C: @type @rec(
-    mem0: f32
-);
+C: @type @rec(mem0: f32);
 
 D: @type C;
 
-b: B = 0;
-c: D = b::mem1::mem0;
+// (
+// d: @var(pos0: s32; pos1: f32) = noval;
+// result := @match(d) u32 (
+//     tag0: capture => expr;
+//     &tag1: capture => expr;
+//     tag2 => expr;
+// );
+// )
+
+

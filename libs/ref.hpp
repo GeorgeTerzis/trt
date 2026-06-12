@@ -14,6 +14,7 @@ using cxx_ref = std::reference_wrapper<T>;
 
 template <typename T>
 struct ref {
+    using value = T;
     using pointer = T*;
     using cpointer = const T*;
     using reference = T&;

@@ -227,6 +227,7 @@ struct node {
         final final;
         median median;
     };
+
     enum class e {
         FINAL,
         MEDIAN,
@@ -1226,6 +1227,19 @@ namespace ast {
             [[clang::musttail]] return get_root(current.deref().parent);
         }
     };
+    void print_scope(const ref_scope& scope, int depth = 0) {
+        if (!scope) {
+            std::println("scope: null");
+            return;
+        }
+        std::println("scope: {} parent: {} entries: {}",
+                     scope.as_void(),
+                     scope.deref().parent.as_void(),
+                     scope.deref().table.size());
+        for (const auto& [id, decl] : scope.deref().table) {
+            std::println("  [{}] -> {}", id, decl.as_void());
+        }
+    }
 
     namespace util {
         struct frame {
@@ -1280,15 +1294,20 @@ namespace ast {
         };
 
         struct fn_t {
+            ref_type type;
             ref_scope scope;
+
             std::span<ref_decl> args;
             ref_type ret_type;
+
             ref_expr body;
         };
 
         struct type_alias_t {
             ref_type type;
         };
+
+        using addressable = type_list<var_t, rec_member_t, fn_parameter_t>;
 
         using variant = std::variant<var_t,
                                      rec_member_t,
@@ -1356,10 +1375,14 @@ namespace ast {
             std::span<ref_expr> args;
         };
 
-        struct call_payload_t {
+        // struct call_payload_t {
+        //     std::span<ref_expr> args;
+        // };
+
+        struct call_t {
+            ref_expr callee;
             std::span<ref_expr> args;
         };
-
         // used to coerse expresions to types
         struct as_t {
             ref_type type;
@@ -1395,12 +1418,6 @@ namespace ast {
         struct unary_op_t {
             op_e op;
             ref_expr operand;
-
-            union payload_t {
-                std::span<ref_expr> args;
-                ref_type type;
-            };
-            payload_t payload;
         };
 
         enum class op_pos : std::uint8_t { prefix, infix, postfix };
@@ -1461,12 +1478,11 @@ namespace ast {
                                      block_t,
                                      rec_init_t,
                                      as_t,
-                                     call_payload_t,
+                                     call_t,
                                      int_literal_t,
                                      float_literal_t,
                                      bool_literal_t,
                                      name_t,
-                                     // rec_access_t,
                                      binary_op_t,
                                      unary_op_t>;
     } // namespace expr_var
@@ -1518,7 +1534,13 @@ namespace ast {
             util::unresolved_range data;
         };
 
+        struct callable_t {
+            std::span<ref_type> args;
+            ref_type ret_type;
+        };
+
         using variant = std::variant<unresolved_t,
+                                     callable_t,
                                      type_alias_t,
                                      integer_literal_t,
                                      float_literal_t,
@@ -2048,13 +2070,16 @@ namespace ast {
                     });
                     auto args = staging.commit();
 
-                    return make_expr(
-                        e,
-                        expr_var::unary_op_t{
-                            .op = expr_var::op_e::opcall,
-                            .operand = callee,
-                            .payload = expr_var::unary_op_t::payload_t{.args = args},
-                        });
+                    return make_expr(e,
+                                     expr_var::call_t{
+                                         .callee = callee,
+                                         .args = args,
+                                     });
+                    // expr_var::unary_op_t{
+                    //     .op = expr_var::op_e::opcall,
+                    //     .operand = callee,
+                    //     .payload = expr_var::unary_op_t::payload_t{.args = args},
+                    // });
                 }
 
                 ref_expr infix(env e, cursor& c, ref_expr lhs, expr_var::op_e op) {
@@ -2281,43 +2306,62 @@ namespace ast {
 
             auto fn(env e, cursor& c, ref_decl ptr) {
                 c++;
-
                 auto scope = make_scope(e);
-                auto staging = staging_vec<ref_decl>(e.allocator);
 
-                auto& parens = c++.get().unsafe_median();
-                expect<median::PARENS>(parens.code);
+                return [](env e, cursor& c, ref_decl ptr) -> auto {
+                    auto staging = staging_vec<ref_decl>(e.allocator);
 
-                std::uint32_t index = 0;
-                median_loop(e.with(scope), parens, [&staging, &index](env e, cursor& c) {
-                    auto& name_node = c++.get();
-                    auto name = name_node.unsafe_final().data;
+                    auto& parens = c++.get().unsafe_median();
+                    expect<median::PARENS>(parens.code);
 
-                    expect_node<final::COLON>(c++.get());
+                    std::uint32_t index = 0;
+                    median_loop(e, parens, [&staging, &index](env e, cursor& c) {
+                        auto& name_node = c++.get();
+                        auto name = name_node.unsafe_final().data;
 
-                    const auto type = type_fn(e, c);
+                        expect_node<final::COLON>(c++.get());
 
-                    auto param = alloc_and_insert_decl(e, name);
-                    param.deref().data =
-                        decl_var::fn_parameter_t{.type = type, .index = index++};
-                    staging.push_back(param);
-                });
+                        const auto type = type_fn(e, c);
 
-                auto args = staging.commit();
+                        auto param = alloc_and_insert_decl(e, name);
+                        param.deref().data =
+                            decl_var::fn_parameter_t{.type = type, .index = index++};
+                        staging.push_back(param);
+                    });
 
-                const auto ret_type = type_fn(e, c);
+                    auto args = staging.commit();
 
-                expect_node<final::ASIGN>(c++.get());
+                    const auto ret_type = type_fn(e, c);
 
-                auto body = expr_fn(e, c);
-                consume_untill<final::TERMINATOR>(c);
+                    expect_node<final::ASIGN>(c++.get());
 
-                return decl_var::fn_t{
-                    .scope = scope,
-                    .args = args,
-                    .ret_type = ret_type,
-                    .body = body,
-                };
+                    auto body = expr_fn(e, c);
+                    consume_untill<final::TERMINATOR>(c);
+
+                    auto fn_type = [&] -> ref_type {
+                        auto type_staging = staging_vec<ref_type>(e.allocator);
+                        for (const auto& elm : args)
+                            type_staging.push_back(
+                                std::get<decl_var::fn_parameter_t>(elm.deref().data)
+                                    .type);
+                        auto types = type_staging.commit();
+                        ref type_ptr = e.allocator.alloc_one<type_t>();
+                        type_ptr.deref().mut = mutability::imut();
+                        type_ptr.deref().data = type_var::callable_t{
+                            .args = types,
+                            .ret_type = ret_type,
+                        };
+                        return type_ptr;
+                    }();
+
+                    return decl_var::fn_t{
+                        .type = fn_type,
+                        .scope = e.scope,
+                        .args = args,
+                        .ret_type = ret_type,
+                        .body = body,
+                    };
+                }(e.with(scope), c, ptr);
             }
 
             // could be a variable or something elsei like a function
@@ -2414,6 +2458,394 @@ namespace ast {
     // maybe not what i had hopped from the MachineGod gemmini to give me back
     // hard coding the operators is diaboloical
     // this thing will be a nihtmare to update
+
+    ref_type type_of_decl(const decl_var::fn_t& v) {
+        return v.type;
+    }
+    template <typename T>
+        requires(is_in_list<std::remove_cvref_t<T>, decl_var::addressable>::value)
+    ref_type type_of_decl(const T& v) {
+        return v.type;
+    }
+    std::optional<ref_type> type_of_decl(const auto& v) {
+        return std::nullopt;
+    }
+    std::optional<ref_type> type_of_decl(const ref_decl ptr) {
+        const auto& val = ptr.deref();
+        return std::visit(
+            overload{
+                [](const auto& v) -> std::optional<ref_type> { return type_of_decl(v); },
+            },
+            val.data);
+    }
+
+    template <typename T>
+    struct is_ref : std::false_type {};
+    template <typename T>
+    struct is_ref<ref<T>> : std::true_type {};
+    template <typename T>
+    inline constexpr bool is_ref_v = is_ref<T>::value;
+
+    template <typename T>
+    struct is_variant : std::false_type {};
+    template <typename... Ts>
+    struct is_variant<std::variant<Ts...>> : std::true_type {};
+    template <typename T>
+    inline constexpr bool is_variant_v = is_variant<T>::value;
+
+    template <typename T>
+    struct is_span_of_ref : std::false_type {};
+    template <typename T>
+    struct is_span_of_ref<std::span<ref<T>>> : std::true_type {};
+    template <typename T>
+    inline constexpr bool is_span_of_ref_v = is_span_of_ref<T>::value;
+
+    template <typename T>
+    struct is_optional_of_ref : std::false_type {};
+    template <typename T>
+    struct is_optional_of_ref<std::optional<ref<T>>> : std::true_type {};
+    template <typename T>
+    inline constexpr bool is_optional_of_ref_v = is_optional_of_ref<T>::value;
+
+    namespace walker {
+        enum Signal {
+            Continue,
+            Skip,
+        };
+
+        template <typename Derived>
+        struct t {
+            std::flat_set<void*> visited;
+
+            constexpr Derived* derived() {
+                return static_cast<Derived*>(this);
+            }
+
+            template <typename Base, typename T>
+            void for_each_member(ref<Base> ptr, T& v) {
+                boost::pfr::for_each_field(v, [&]<typename F>(F& field) {
+                    if constexpr (is_ref_v<F> && !std::is_same_v<ref_scope, F>) {
+                        visit(field);
+                    } else if constexpr (is_optional_of_ref_v<F>) {
+                        if (field) {
+                            visit(*field);
+                        }
+                    } else if constexpr (is_span_of_ref_v<F>) {
+                        for (auto& elm : field) {
+                            visit(elm);
+                        }
+                    } else if constexpr (std::is_same_v<util::frame, F>) {
+                        visit(field.stmts);
+                    }
+                });
+            }
+
+            template <typename Ref>
+                requires is_ref_v<Ref>
+            void visit(Ref ptr) {
+                if (this->visited.contains(ptr.as_void())) {
+                    return;
+                }
+
+                auto result = derived()->ptr_entry(ptr);
+                if (result == Continue) {
+                    if constexpr (requires { ptr.deref().data; }) {
+
+                        std::visit(overload{[&](auto& v) {
+                                       auto result = derived()->entry(ptr, v);
+                                       if (result == Continue) {
+                                           for_each_member(ptr, v);
+                                       }
+                                       derived()->exit(ptr, v);
+                                   }},
+                                   ptr.deref().data);
+                    } else if constexpr (requires { ptr.deref().span; }) {
+                        for (auto& elm : ptr.deref().span) {
+                            visit(elm);
+                        }
+                    }
+                }
+                derived()->ptr_exit(ptr);
+                this->visited.insert(ptr.as_void());
+            }
+        };
+    } // namespace walker
+
+    struct Resolver : walker::t<Resolver> {
+        allocator_t& allocator;
+
+        walker::Signal ptr_entry(auto ptr) {
+            return walker::Continue;
+        }
+        void ptr_exit(auto ptr) {}
+
+        walker::Signal entry(auto ptr, auto& v) {
+            return walker::Continue;
+        }
+        void exit(auto ptr, auto& v) {}
+
+        std::flat_set<void*> resolving;
+        std::vector<ref_scope> scopes;
+
+        void insert(void* ptr) {
+            if (resolving.contains(ptr))
+                throw std::runtime_error("Recursive resolution attempted");
+
+            resolving.insert(ptr);
+        }
+
+        void remove(void* ptr) {
+            if (!resolving.contains(ptr))
+                throw std::runtime_error("Attempted to erase non existant entry");
+
+            resolving.erase(ptr);
+        }
+
+        void insert_scope(ref_scope scope) {
+            // std::println("scope::{} with parent::{}",
+            //              scope.as_void(),
+            //              scope.deref().parent.as_void());
+            scopes.push_back(scope);
+        }
+        void pop_scope() {
+            scopes.pop_back();
+        }
+        ref_scope back_scope() {
+            return scopes.back();
+        }
+
+        walker::Signal entry(ref_expr ptr, expr_var::access_t& v) {
+            visit(v.lhs);
+            auto scope = scope_of_type(v.lhs.deref().type);
+            if (!scope) {
+                throw_error("Expected symbol to have a scope");
+            }
+            this->insert_scope(scope);
+            visit(v.rhs);
+            return walker::Skip;
+        }
+
+        void exit(ref_expr ptr, expr_var::access_t& v) {
+            pop_scope();
+        }
+
+        walker::Signal entry(ref_expr ptr, expr_var::unresolved_t& v) {
+            insert(ptr.as_void());
+
+            auto scope = this->back_scope();
+
+            // needs some kind of scoping we can't really go around just resolving like
+            // this
+            //  if this get's hit by something that is part of an access then  we use the
+            //  right scope but the wrong lookup function
+            auto lookup = scope_t::ancestor_lookup(scope, v.name.name);
+            // print_scope(scope);
+            // print_scope(scope.deref().parent);
+            if (!lookup) [[unlikely]] {
+                throw_error("Expected expresion name lookup to resolve");
+            }
+            auto& lv = lookup.value();
+            ptr.deref().data = expr_var::name_t{lv.symbol};
+
+            // this probably needs to be expanded upon
+            // I might try to automate this slightly so I do not have to manually write
+            // every visitor.
+            // But it works for <name>::<something> not for ()::<something>
+            // since we need to deduce it's type
+
+            // this will be moved to the exrp_type_resolve function
+
+            {
+                auto type = std::visit(
+                    overload{[&](decl_var::fn_t& var) -> ref_type { return var.type; },
+                             [&]<typename T>(T& var) -> ref_type
+                                 requires(is_in_list<std::remove_cvref_t<T>,
+                                                     decl_var::addressable>::value)
+                             { return var.type; },
+                             [](auto& val) -> ref_type {
+                                 throw_error("Expected this to resolve to a variable");
+                             }},
+                             lv.symbol.deref().data);
+                visit(type);
+                ptr.deref().type = type;
+            }
+
+            remove(ptr.as_void());
+            return walker::Continue;
+
+        } // namespace ast
+
+        template <bool local = false>
+        ref_decl resolve_type_chain(cursor& c, const cursor& end, ref_scope scope) {
+            if (c.cursor == end.cursor)
+                throw_error("Empty type chain");
+
+            const auto& n = c++.get();
+
+            if (!n.isa(final::ID)) [[unlikely]]
+                throw_error(
+                    std::format("Expected ID in type chain, got {}", lexer::str(n)));
+
+            const auto id = n.unsafe_final().data;
+
+            constexpr auto lookup_fn =
+                local ? scope_t::local_lookup : scope_t::ancestor_lookup;
+
+            auto lookup = lookup_fn(scope, id);
+
+            if (!lookup)
+                throw_error(std::format("Unknown type symbol"));
+
+            const auto result = lookup->symbol;
+
+            // consume :: if present
+            if (c.cursor != end.cursor) {
+                if (!c.get().isa(final::DCOLON)) [[unlikely]] {
+                    throw_error(
+                        std::format("Expected '::' after ID in type chain, got {}",
+                                    lexer::str(c.get())));
+                }
+                c++;
+
+                if (c.cursor == end.cursor) [[unlikely]]
+                    throw_error("Trailing '::' in type chain");
+
+                auto next_scope = scope_of_decl(result);
+                return resolve_type_chain<true>(c, end, next_scope);
+            }
+
+            return result;
+        }
+
+        walker::Signal entry(ref_type ptr, type_var::unresolved_t& v) {
+            insert(ptr.as_void());
+
+            auto c = v.data.begin;
+            const auto result = resolve_type_chain(c, v.data.end, scopes.back());
+
+            if (!result)
+                throw_error("Empty type chain");
+
+            auto resolved_type = [&]() {
+                const auto* alias =
+                    std::get_if<decl_var::type_alias_t>(&result.deref().data);
+                if (alias) {
+                    return std::optional{std::cref(alias->type)};
+                }
+                return decltype(std::optional{std::cref(alias->type)}){};
+            }();
+
+            if (const auto& rt = resolved_type) {
+                ptr.deref().data = type_var::type_alias_t{rt.value()};
+            } else {
+                throw_error("Expected a type declaration");
+            }
+
+            remove(ptr.as_void());
+            return walker::Continue;
+        }
+
+        walker::Signal entry(ref_decl ptr, decl_var::fn_t& v) {
+            insert_scope(v.scope);
+            return walker::Continue;
+        }
+        void exit(ref_decl ptr, decl_var::fn_t& v) {
+            pop_scope();
+        }
+        walker::Signal entry(ref_expr ptr, expr_var::block_t& v) {
+            insert_scope(v.frame.scope);
+            return walker::Continue;
+        }
+        void exit(ref_expr ptr, expr_var::block_t& v) {
+            pop_scope();
+        }
+        walker::Signal entry(ref_type ptr, type_var::rec_t& v) {
+            insert_scope(v.scope);
+
+            return walker::Continue;
+        }
+        void exit(ref_type ptr, type_var::rec_t& v) {
+            pop_scope();
+        }
+
+        static ref_type resolve_expr_type(allocator_t& allocator,
+                                          const expr_var::variant& var) {
+            return std::visit(
+                overload{
+                    // these 3  require allocation
+                    // so I guess I have to bring in some kind of allocator maybe even
+                    // enviroment
+                    [&](const expr_var::int_literal_t& v) -> ref_type {
+                        auto ptr = allocator.alloc_one<type_t>();
+                        ptr->data = type_var::integer_literal_t{};
+                        return ptr;
+                    },
+                    [&](const expr_var::float_literal_t& v) -> ref_type {
+                        auto ptr = allocator.alloc_one<type_t>();
+                        ptr->data = type_var::float_literal_t{};
+                        return ptr;
+                    },
+                    [&](const expr_var::bool_literal_t& v) -> ref_type {
+                        auto ptr = allocator.alloc_one<type_t>();
+                        ptr->data = type_var::integer_literal_t{};
+                        return ptr;
+                    },
+                    [&](const expr_var::binary_op_t& v) -> ref_type {
+                        switch (v.op) {
+                        case expr_var::op_e::opadd:
+                        case expr_var::op_e::opdiv:
+                        case expr_var::op_e::opmul:
+                        case expr_var::op_e::opsub: {
+                            return v.lhs.deref().type;
+                        }
+                        case expr_var::op_e::opor:
+                        case expr_var::op_e::opand: {
+                            auto ptr = allocator.alloc_one<type_t>();
+                            ptr->data = type_var::integer_literal_t{};
+                            return ptr;
+                        }
+                        default:
+                            throw_error("TODO");
+                        }
+                    },
+                    // these 2 are basicaly operators
+                    [&](const expr_var::access_t& v) { return v.rhs.deref().type; },
+                    [&](const expr_var::call_t& v) {
+                        const auto callee_type = v.callee.deref().type;
+                        // DO NOT JUST LET IT THROW
+                        // FIX later i guess
+                        const auto& fntype =
+                            std::get<type_var::callable_t>(callee_type.deref().data);
+                        return fntype.ret_type;
+                    },
+
+                    [&](const expr_var::rec_init_t& v) -> ref_type { return v.type; },
+                    [&](const expr_var::name_t& v) -> ref_type {
+                        auto decl_type = type_of_decl(v.decl);
+                        if (!decl_type)
+                            throw_error("Declaration can't have a type");
+                        return decl_type.value();
+                    },
+                    [&](const expr_var::as_t& v) -> ref_type { return v.type; },
+                    [](auto& v) -> ref_type { return nullptr; },
+                },
+                var);
+        } // namespace ast
+
+        void ptr_exit(ref_expr ptr) {
+            auto& val = ptr.deref();
+            if (!val.type) {
+                auto t = resolve_expr_type(this->allocator, val.data);
+                val.type = t;
+            }
+
+            // if (!val.type) {
+            //     std::println("expr {} :: Still Needs resolving", ptr.as_void());
+            // } else {
+            //     // std::println("expr {} :: Has type", ptr.as_void());
+            // }
+        }
+    };
     namespace SLOP {
 
         static std::string default_name_resolver(std::uint32_t id) {
@@ -2549,6 +2981,13 @@ namespace ast {
                 os << 'f' << S;
             }
 
+            void print_type(const type_var::callable_t& v) {
+                os << "@fn";
+                print(v.ret_type);
+                os << "::args::";
+                for (const auto& elm : v.args)
+                    print(elm);
+            }
             void print_type(const type_var::ptr_t& v) {
                 os << '*';
                 print(v.type);
@@ -2613,7 +3052,8 @@ namespace ast {
                 os << " }";
             }
 
-            void print_expr(const expr_var::call_payload_t& v) {
+            void print_expr(const expr_var::call_t& v) {
+                print(v.callee);
                 os << '(';
                 print_args(v.args);
                 os << ')';
@@ -2628,15 +3068,8 @@ namespace ast {
             }
 
             void print_expr(const expr_var::unary_op_t& v) {
-                if (v.op == expr_var::op_e::opcall) {
-                    print(v.operand);
-                    os << '(';
-                    print_args(v.payload.args);
-                    os << ')';
-                } else {
-                    os << op_str(v.op);
-                    print(v.operand);
-                }
+                os << op_str(v.op);
+                print(v.operand);
             }
 
             void print_expr(const expr_var::block_t& v) {
@@ -2724,259 +3157,169 @@ namespace ast {
         template <typename NameResolver>
         printer(std::ostream&, NameResolver) -> printer<NameResolver>;
 
-    } // namespace SLOP
-    template <typename T>
-    struct is_ref : std::false_type {};
-    template <typename T>
-    struct is_ref<ref<T>> : std::true_type {};
-    template <typename T>
-    inline constexpr bool is_ref_v = is_ref<T>::value;
+        struct ExprTreePrinter : walker::t<ExprTreePrinter> {
+            std::ostream& os;
+            std::vector<bool> last_child_stack;
 
-    template <typename T>
-    struct is_variant : std::false_type {};
-    template <typename... Ts>
-    struct is_variant<std::variant<Ts...>> : std::true_type {};
-    template <typename T>
-    inline constexpr bool is_variant_v = is_variant<T>::value;
+            explicit ExprTreePrinter(std::ostream& os) : os(os) {}
 
-    template <typename T>
-    struct is_span_of_ref : std::false_type {};
-    template <typename T>
-    struct is_span_of_ref<std::span<ref<T>>> : std::true_type {};
-    template <typename T>
-    inline constexpr bool is_span_of_ref_v = is_span_of_ref<T>::value;
+            walker::Signal ptr_entry(auto ptr) {
+                return walker::Continue;
+            }
+            void ptr_exit(auto ptr) {}
+            walker::Signal entry(auto ptr, auto& v) {
+                return walker::Continue;
+            }
+            void exit(auto ptr, auto& v) {}
 
-    template <typename T>
-    struct is_optional_of_ref : std::false_type {};
-    template <typename T>
-    struct is_optional_of_ref<std::optional<ref<T>>> : std::true_type {};
-    template <typename T>
-    inline constexpr bool is_optional_of_ref_v = is_optional_of_ref<T>::value;
-
-    namespace walker {
-        template <typename Derived>
-        struct t {
-
-            constexpr Derived* derived() {
-                return static_cast<Derived*>(this);
+          private:
+            void print_prefix() {
+                for (size_t i = 0; i + 1 < last_child_stack.size(); ++i)
+                    os << (last_child_stack[i] ? "    " : "│   ");
+                if (!last_child_stack.empty())
+                    os << (last_child_stack.back() ? "└── " : "├── ");
             }
 
-            template <typename Base, typename T>
-            void for_each_member(ref<Base> ptr, T& v) {
-                boost::pfr::for_each_field(v, [&]<typename F>(F& field) {
-                    if constexpr (is_ref_v<F> && !std::is_same_v<ref_scope, F>) {
-                        visit(field);
-                    } else if constexpr (is_optional_of_ref_v<F>) {
-                        if (field) {
-                            visit(*field);
-                        }
-                    } else if constexpr (is_span_of_ref_v<F>) {
-                        for (auto& elm : field) {
-                            visit(elm);
-                        }
-                    } else if constexpr (requires(T t) {
-                                             { t.frame } -> std::same_as<util::frame&>;
-                                         }) {
-                        visit(field.stmts);
-                    }
-                });
-            }
-
-            template <typename Ref>
-                requires is_ref_v<Ref>
-            void visit(Ref ptr) {
-                if constexpr (requires { ptr.deref().data; }) {
-                    std::visit(overload{[&](auto& v) {
-                                   derived()->entry(ptr, v);
-                                   for_each_member(ptr, v);
-                                   derived()->exit(ptr, v);
-                               }},
-                               ptr.deref().data);
-                } else if constexpr (requires { ptr.deref().span; }) {
-                    for (auto& elm : ptr.deref().span) {
-                        visit(elm);
-                    }
+            void visit_children(std::span<ref_expr> children) {
+                for (size_t i = 0; i < children.size(); ++i) {
+                    last_child_stack.push_back(i + 1 == children.size());
+                    visit(children[i]);
+                    last_child_stack.pop_back();
                 }
+            }
+
+            void visit_child(ref_expr child, bool is_last) {
+                last_child_stack.push_back(is_last);
+                visit(child);
+                last_child_stack.pop_back();
+            }
+
+            static std::string type_label(ref_type t) {
+                if (!t)
+                    return "<no type>";
+                return std::visit(
+                    overload{
+                        [](const type_var::integer_literal_t&) -> std::string {
+                            return "int_literal";
+                        },
+                        [](const type_var::float_literal_t&) -> std::string {
+                            return "float_literal";
+                        },
+                        [](const type_var::uint_t& v) -> std::string {
+                            return std::format("u{}", v.bit_size);
+                        },
+                        [](const type_var::sint_t& v) -> std::string {
+                            return std::format("i{}", v.bit_size);
+                        },
+                        [](const type_var::f16_t&) -> std::string { return "f16"; },
+                        [](const type_var::f32_t&) -> std::string { return "f32"; },
+                        [](const type_var::f64_t&) -> std::string { return "f64"; },
+                        [](const type_var::f128_t&) -> std::string { return "f128"; },
+                        [](const type_var::void_t&) -> std::string { return "void"; },
+                        [](const type_var::optr_t&) -> std::string { return "optr"; },
+                        [](const type_var::ptr_t&) -> std::string { return "ptr"; },
+                        [](const type_var::rec_t&) -> std::string { return "rec"; },
+                        [](const type_var::callable_t&) -> std::string {
+                            return "callable";
+                        },
+                        [](const type_var::type_alias_t& v) -> std::string {
+                            return type_label(v.type);
+                        },
+                        [](const type_var::unresolved_t&) -> std::string {
+                            return "<unresolved>";
+                        },
+                    },
+                    t.deref().data);
+            }
+
+            static constexpr std::string_view op_str(expr_var::op_e op) {
+                switch (op) {
+                case expr_var::op_e::opadd:
+                    return "+";
+                case expr_var::op_e::opsub:
+                    return "-";
+                case expr_var::op_e::opmul:
+                    return "*";
+                case expr_var::op_e::opdiv:
+                    return "/";
+                case expr_var::op_e::opand:
+                    return "&&";
+                case expr_var::op_e::opor:
+                    return "||";
+                default:
+                    return "?";
+                }
+            }
+
+            void node(ref_expr ptr, std::string_view label) {
+                print_prefix();
+                os << label << " :: " << type_label(ptr.deref().type) << "\n";
+            }
+
+          public:
+            walker::Signal entry(ref_expr ptr, expr_var::int_literal_t& v) {
+                node(ptr, std::format("IntLit({})", v.value));
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::float_literal_t& v) {
+                node(ptr, std::format("FloatLit({})", v.value));
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::bool_literal_t& v) {
+                node(ptr, std::format("BoolLit({})", v.value ? "true" : "false"));
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::unresolved_t& v) {
+                node(ptr, "Unresolved");
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::name_t& v) {
+                node(
+                    ptr,
+                    std::format("Name({})",
+                                v.decl ? std::to_string(v.decl.deref().name) : "<null>"));
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::binary_op_t& v) {
+                node(ptr, std::format("BinOp({})", op_str(v.op)));
+                visit_child(v.lhs, false);
+                visit_child(v.rhs, true);
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::unary_op_t& v) {
+                node(ptr, std::format("UnaryOp({})", op_str(v.op)));
+                visit_child(v.operand, true);
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::call_t& v) {
+                node(ptr, "Call");
+                visit_child(v.callee, v.args.empty());
+                visit_children(v.args);
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::access_t& v) {
+                node(ptr, "Access");
+                visit_child(v.lhs, false);
+                visit_child(v.rhs, true);
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::rec_init_t& v) {
+                node(ptr, "RecInit");
+                visit_children(v.args);
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::as_t& v) {
+                node(ptr, "As");
+                visit_child(v.expr, true);
+                return walker::Skip;
+            }
+            walker::Signal entry(ref_expr ptr, expr_var::block_t& v) {
+                node(ptr, "Block");
+                visit(v.frame.stmts);
+                return walker::Skip;
             }
         };
-    } // namespace walker
-
-    struct Resolver : walker::t<Resolver> {
-        std::flat_set<void*> resolving;
-        std::vector<ref_scope> scopes;
-
-        void insert(void* ptr) {
-            if (resolving.contains(ptr))
-                throw std::runtime_error("Recursive resolution attempted");
-
-            resolving.insert(ptr);
-        }
-
-        void remove(void* ptr) {
-            if (!resolving.contains(ptr))
-                throw std::runtime_error("Attempted to erase non existant entry");
-
-            resolving.erase(ptr);
-        }
-
-        void insert_scope(ref_scope scope) {
-            // std::println("scope::{} with parent::{}",
-            //              scope.as_void(),
-            //              scope.deref().parent.as_void());
-            scopes.push_back(scope);
-        }
-        void pop_scope() {
-            scopes.pop_back();
-        }
-        ref_scope back_scope() {
-            return scopes.back();
-        }
-
-        void entry(ref_expr ptr, expr_var::access_t& v) {
-            visit(v.lhs);
-            visit(v.lhs.deref().type);
-            auto scope = scope_of_type(v.lhs.deref().type);
-            if (!scope) {
-                throw_error("Expected symbol to have a scope");
-            }
-            this->insert_scope(scope);
-            visit(v.rhs);
-        }
-
-        void exit(ref_expr ptr, expr_var::access_t& v) {
-            pop_scope();
-        }
-
-        void entry(ref_expr ptr, expr_var::unresolved_t& v) {
-            insert(ptr.as_void());
-
-            auto scope = this->back_scope();
-
-            // needs some kind of scoping we can't really go around just resolving like
-            // this
-            //  if this get's hit by something that is part of an access then  we use the
-            //  right scope but the wrong lookup function
-            auto lookup = scope_t::ancestor_lookup(scope, v.name.name);
-            if (!lookup) [[unlikely]]
-                throw_error("Expected expresion name lookup to resolve");
-
-            auto& lv = lookup.value();
-            ptr.deref().data = expr_var::name_t{lv.symbol};
-
-            // this probably needs to be expanded upon
-            // I might try to automate this slightly so I do not have to manually write
-            // every visitor.
-            // But it works for <name>::<something> not for ()::<something>
-            // since we need to deduce it's type
-
-            ref_type type = std::visit(
-                overload{
-                    [&](decl_var::var_t& var) -> ref_type { return var.type; },
-                    [&](decl_var::rec_member_t& var) -> ref_type { return var.type; },
-                    [&](decl_var::fn_parameter_t& var) -> ref_type { return var.type; },
-                    [](auto& val) -> ref_type {
-                        throw_error("Expected this to resolve to a variable");
-                    }},
-                lv.symbol.deref().data);
-
-            ptr.deref().type = type;
-
-            remove(ptr.as_void());
-        }
-
-        template <bool local = false>
-        ref_decl resolve_type_chain(cursor& c, const cursor& end, ref_scope scope) {
-            if (c.cursor == end.cursor)
-                throw_error("Empty type chain");
-
-            const auto& n = c++.get();
-
-            if (!n.isa(final::ID)) [[unlikely]]
-                throw_error(
-                    std::format("Expected ID in type chain, got {}", lexer::str(n)));
-
-            const auto id = n.unsafe_final().data;
-
-            constexpr auto lookup_fn =
-                local ? scope_t::local_lookup : scope_t::ancestor_lookup;
-
-            auto lookup = lookup_fn(scope, id);
-
-            if (!lookup)
-                throw_error(std::format("Unknown type symbol"));
-
-            const auto result = lookup->symbol;
-
-            // consume :: if present
-            if (c.cursor != end.cursor) {
-                if (!c.get().isa(final::DCOLON)) [[unlikely]] {
-                    throw_error(
-                        std::format("Expected '::' after ID in type chain, got {}",
-                                    lexer::str(c.get())));
-                }
-                c++;
-
-                if (c.cursor == end.cursor) [[unlikely]]
-                    throw_error("Trailing '::' in type chain");
-
-                auto next_scope = scope_of_decl(result);
-                return resolve_type_chain<true>(c, end, next_scope);
-            }
-
-            return result;
-        }
-
-        void entry(ref_type ptr, type_var::unresolved_t& v) {
-            insert(ptr.as_void());
-
-            auto c = v.data.begin;
-            const auto result = resolve_type_chain(c, v.data.end, scopes.back());
-
-            if (!result)
-                throw_error("Empty type chain");
-
-            auto resolved_type = [&]() {
-                const auto* alias =
-                    std::get_if<decl_var::type_alias_t>(&result.deref().data);
-                if (alias) {
-                    return std::optional{std::cref(alias->type)};
-                }
-                return decltype(std::optional{std::cref(alias->type)}){};
-            }();
-
-            if (const auto& rt = resolved_type) {
-                ptr.deref().data = type_var::type_alias_t{rt.value()};
-            } else {
-                throw_error("Expected a type declaration");
-            }
-
-            remove(ptr.as_void());
-        }
-
-        void exit(ref_type ptr, type_var::unresolved_t& v) {}
-
-        void entry(ref_decl ptr, decl_var::fn_t& v) {
-            insert_scope(v.scope);
-        }
-        void exit(ref_decl ptr, decl_var::fn_t& v) {
-            pop_scope();
-        }
-        void entry(ref_expr ptr, expr_var::block_t& v) {
-            insert_scope(v.frame.scope);
-        }
-        void exit(ref_expr ptr, expr_var::block_t& v) {
-            pop_scope();
-        }
-        void entry(ref_type ptr, type_var::rec_t& v) {
-            insert_scope(v.scope);
-        }
-        void exit(ref_type ptr, type_var::rec_t& v) {
-            pop_scope();
-        }
-
-        void entry(auto ptr, auto& v) {}
-        void exit(auto ptr, auto& v) {}
-    };
+    } // namespace SLOP
 
     ref_stmts entry(allocator_t& allocator, const lexer::buffer& buffer) {
         auto& node = buffer.get_node(0);
@@ -2991,9 +3334,14 @@ namespace ast {
 
         auto file = node2ast::stmts_fn(e, c);
 
-        Resolver v;
+        Resolver v{
+            .allocator = e.allocator,
+        };
         v.scopes.push_back(scope);
         v.visit(file);
+
+        SLOP::ExprTreePrinter ep(std::cerr);
+        ep.visit(file);
 
         return file;
     }
@@ -3180,6 +3528,9 @@ namespace codegen {
             u.context(),
             llvm::ArrayRef<llvm::Type*>(fields.data(), fields.size()));
     }
+    llvm::Type* gen_type(unit& u, const ast::type_var::callable_t& t) {
+        return nullptr;
+    }
 
     llvm::Type* gen_type(unit& u, const ast::type_t& t) {
         return std::visit([&](const auto& v) { return gen_type(u, v); }, t.data);
@@ -3228,8 +3579,7 @@ namespace codegen {
     llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::access_t& v) {
         return nullptr;
     }
-    llvm::Value*
-    gen_expr(unit& u, value_cache& cache, const ast::expr_var::call_payload_t& v) {
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::call_t& v) {
         return nullptr;
     }
     llvm::Value*
