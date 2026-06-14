@@ -2,6 +2,15 @@
 
 #include "llvm_allocator.hpp"
 
+// because we need recursion and
+// it would be prefereable to have
+// everything in one contigious span
+// we do this
+// 5 elements is probably good enough?
+// I could go further or even expose it
+
+// DO NOT USE THIS AS A MEMBER
+// THIS IS MEANT TO BE CONSUMED
 template <typename T>
 struct staging_vec {
     using Allocator = llvm_allocator;

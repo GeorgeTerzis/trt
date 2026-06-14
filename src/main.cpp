@@ -2,7 +2,7 @@
 
 #include "./file_loader.cpp"
 
-#include "../include/utf8.h"
+// #include "../include/utf8.h"
 #include "../include/utf8/checked.h"
 
 #include "../libs/llvm_allocator.hpp"
@@ -18,7 +18,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <cwctype>
 #include <flat_map>
 #include <flat_set>
 #include <format>
@@ -58,12 +57,10 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
-#include <locale.h>
-#include <memory_resource>
+// #include <memory_resource>
 #include <optional>
 #include <print>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -80,18 +77,10 @@ template <typename... Func>
 struct overload : Func... {
     using Func::operator()...;
 };
-
 template <typename... Func>
 overload(Func...) -> overload<Func...>;
 
-// I hate this
-// I could eliminate this by having 2 allocators
-// 1 for temporary allocations like vectors and once they are done I copy paste them to
-// the main one and 1 for long living allocations refrences
-// do not use this as a member
-
-inline std::string source_location_to_string(
-    const std::source_location& loc = std::source_location::current()) {
+inline std::string source_location_to_string(const std::source_location& loc) {
     char buffer[1024];
     std::snprintf(buffer,
                   sizeof(buffer),
@@ -507,10 +496,12 @@ namespace lexer {
             return &it - nodes.begin();
         }
 
+        std::string_view str(intern_id id) const {
+            return itable.lookup(id);
+        }
         std::string_view str(source_location loc) const {
             return loc.source(src.text);
         }
-
         std::string_view str(const node* node) const {
             auto index = to_index(node);
             auto location = loc(index);
@@ -1087,7 +1078,7 @@ namespace lexer {
         table['b'] = prefixed_numeric_or_id;
 
         table['/'] = line_comment;
-
+        table['\"'] = strlit;
         return table;
     }();
 
@@ -1171,6 +1162,14 @@ namespace lexer {
 } // namespace lexer
 
 namespace ast {
+    // One of the biggest problems (not so much of a problem but there is a fix to it)
+    // is the reallocation of stateless types, like uint, sint, floating, void, opaque...
+    // even record types you can say that they have this problem but they are more complex
+    // to implement it on. So I should keep a cache for these types since they are goingto
+    // be reused everywhere
+    // but I shouldn't expect the program to know this about these types because when I
+    // decide to allow multiple files it is just going to complicate things.
+
     using cursor = const_cursor_t;
 
     struct decl_t;
@@ -1295,12 +1294,19 @@ namespace ast {
 
         struct fn_t {
             ref_type type;
-            ref_scope scope;
 
+            ref_scope scope;
             std::span<ref_decl> args;
             ref_type ret_type;
-
             ref_expr body;
+        };
+
+        struct efn_t {
+            ref_type type;
+            ref_scope scope;
+            std::span<ref_decl> args;
+            ref_type ret_type;
+            std::string_view external_symbol_name;
         };
 
         struct type_alias_t {
@@ -1308,12 +1314,14 @@ namespace ast {
         };
 
         using addressable = type_list<var_t, rec_member_t, fn_parameter_t>;
+        using callable = type_list<fn_t, efn_t>;
 
         using variant = std::variant<var_t,
                                      rec_member_t,
                                      tagged_union_member_t,
                                      fn_parameter_t,
                                      fn_t,
+                                     efn_t,
                                      type_alias_t>;
     }; // namespace decl_var
 
@@ -1644,6 +1652,7 @@ namespace ast {
     struct env {
       public:
         const lexer::buffer& buffer;
+        const llvm::DataLayout& target_data_layout;
         allocator_t& allocator;
         ref_scope scope;
         // ref_ast parent;
@@ -2192,14 +2201,16 @@ namespace ast {
                     .path<final::TYPE_USIZE>(
                         [](env e, cursor& c) -> type_var::variant {
                             c++;
-                            return type_var::uint_t{64};
+                            return type_var::uint_t{
+                                e.target_data_layout.getPointerSizeInBits()};
                         },
                         e,
                         c)
                     .path<final::TYPE_ISIZE>(
                         [](env e, cursor& c) -> type_var::variant {
                             c++;
-                            return type_var::sint_t{64};
+                            return type_var::sint_t{
+                                e.target_data_layout.getPointerSizeInBits()};
                         },
                         e,
                         c)
@@ -2307,36 +2318,25 @@ namespace ast {
             auto fn(env e, cursor& c, ref_decl ptr) {
                 c++;
                 auto scope = make_scope(e);
-
                 return [](env e, cursor& c, ref_decl ptr) -> auto {
                     auto staging = staging_vec<ref_decl>(e.allocator);
-
                     auto& parens = c++.get().unsafe_median();
                     expect<median::PARENS>(parens.code);
-
                     std::uint32_t index = 0;
                     median_loop(e, parens, [&staging, &index](env e, cursor& c) {
                         auto& name_node = c++.get();
                         auto name = name_node.unsafe_final().data;
-
                         expect_node<final::COLON>(c++.get());
-
                         const auto type = type_fn(e, c);
-
                         auto param = alloc_and_insert_decl(e, name);
                         param.deref().data =
                             decl_var::fn_parameter_t{.type = type, .index = index++};
                         staging.push_back(param);
                     });
-
                     auto args = staging.commit();
-
                     const auto ret_type = type_fn(e, c);
 
                     expect_node<final::ASIGN>(c++.get());
-
-                    auto body = expr_fn(e, c);
-                    consume_untill<final::TERMINATOR>(c);
 
                     auto fn_type = [&] -> ref_type {
                         auto type_staging = staging_vec<ref_type>(e.allocator);
@@ -2354,16 +2354,33 @@ namespace ast {
                         return type_ptr;
                     }();
 
-                    return decl_var::fn_t{
+                    // @external "symbol_name" path
+                    if (c.get().isa(final::EXTERNAL)) {
+                        c++;
+                        const auto& sym_node = c++.get();
+                        expect_node<final::STRING_LIT>(sym_node);
+                        consume_untill<final::TERMINATOR>(c);
+                        return decl_var::variant{decl_var::efn_t{
+                            .type = fn_type,
+                            .scope = e.scope,
+                            .args = args,
+                            .ret_type = ret_type,
+                            .external_symbol_name = e.buffer.str(&sym_node),
+                        }};
+                    }
+
+                    // regular fn path
+                    auto body = expr_fn(e, c);
+                    consume_untill<final::TERMINATOR>(c);
+                    return decl_var::variant{decl_var::fn_t{
                         .type = fn_type,
                         .scope = e.scope,
                         .args = args,
                         .ret_type = ret_type,
                         .body = body,
-                    };
+                    }};
                 }(e.with(scope), c, ptr);
             }
-
             // could be a variable or something elsei like a function
             auto var(env e, cursor& c, ref_decl ptr) {
                 const auto type = type_fn(e, c);
@@ -2477,6 +2494,73 @@ namespace ast {
                 [](const auto& v) -> std::optional<ref_type> { return type_of_decl(v); },
             },
             val.data);
+    }
+
+    static ref_type resolve_expr_type(allocator_t& allocator,
+                                      const expr_var::variant& var) {
+        return std::visit(
+            overload{
+                // these 3  require allocation
+                // so I guess I have to bring in some kind of allocator maybe even
+                // enviroment
+                // I could also have some kind of cache where I resue the same pointer
+                // for these stateless types like void, lit, etc..
+                // It would save a lot of memory, less allocations
+                [&](const expr_var::int_literal_t& v) -> ref_type {
+                    auto ptr = allocator.alloc_one<type_t>();
+                    ptr->data = type_var::integer_literal_t{};
+                    return ptr;
+                },
+                [&](const expr_var::float_literal_t& v) -> ref_type {
+                    auto ptr = allocator.alloc_one<type_t>();
+                    ptr->data = type_var::float_literal_t{};
+                    return ptr;
+                },
+                [&](const expr_var::bool_literal_t& v) -> ref_type {
+                    auto ptr = allocator.alloc_one<type_t>();
+                    ptr->data = type_var::integer_literal_t{};
+                    return ptr;
+                },
+                [&](const expr_var::binary_op_t& v) -> ref_type {
+                    switch (v.op) {
+                    case expr_var::op_e::opadd:
+                    case expr_var::op_e::opdiv:
+                    case expr_var::op_e::opmul:
+                    case expr_var::op_e::opsub: {
+                        return v.lhs.deref().type;
+                    }
+                    case expr_var::op_e::opor:
+                    case expr_var::op_e::opand: {
+                        auto ptr = allocator.alloc_one<type_t>();
+                        ptr->data = type_var::integer_literal_t{};
+                        return ptr;
+                    }
+                    default:
+                        throw_error("TODO");
+                    }
+                },
+                // these 2 are basicaly operators
+                [&](const expr_var::access_t& v) { return v.rhs.deref().type; },
+                [&](const expr_var::call_t& v) {
+                    const auto callee_type = v.callee.deref().type;
+                    // DO NOT JUST LET IT THROW
+                    // FIX later i guess
+                    const auto& fntype =
+                        std::get<type_var::callable_t>(callee_type.deref().data);
+                    return fntype.ret_type;
+                },
+
+                [&](const expr_var::rec_init_t& v) -> ref_type { return v.type; },
+                [&](const expr_var::name_t& v) -> ref_type {
+                    auto decl_type = type_of_decl(v.decl);
+                    if (!decl_type)
+                        throw_error("Declaration can't have a type");
+                    return decl_type.value();
+                },
+                [&](const expr_var::as_t& v) -> ref_type { return v.type; },
+                [](auto& v) -> ref_type { return nullptr; },
+            },
+            var);
     }
 
     template <typename T>
@@ -2657,13 +2741,14 @@ namespace ast {
 
             {
                 auto type = std::visit(
-                    overload{[&](decl_var::fn_t& var) -> ref_type { return var.type; },
+                    overload{[&](decl_var::efn_t& var) -> ref_type { return var.type; },
+                             [&](decl_var::fn_t& var) -> ref_type { return var.type; },
                              [&]<typename T>(T& var) -> ref_type
                                  requires(is_in_list<std::remove_cvref_t<T>,
                                                      decl_var::addressable>::value)
                              { return var.type; },
                              [](auto& val) -> ref_type {
-                                 throw_error("Expected this to resolve to a variable");
+                                 throw_error("Expected this to resolve to a type");
                              }},
                              lv.symbol.deref().data);
                 visit(type);
@@ -2768,86 +2853,16 @@ namespace ast {
             pop_scope();
         }
 
-        static ref_type resolve_expr_type(allocator_t& allocator,
-                                          const expr_var::variant& var) {
-            return std::visit(
-                overload{
-                    // these 3  require allocation
-                    // so I guess I have to bring in some kind of allocator maybe even
-                    // enviroment
-                    [&](const expr_var::int_literal_t& v) -> ref_type {
-                        auto ptr = allocator.alloc_one<type_t>();
-                        ptr->data = type_var::integer_literal_t{};
-                        return ptr;
-                    },
-                    [&](const expr_var::float_literal_t& v) -> ref_type {
-                        auto ptr = allocator.alloc_one<type_t>();
-                        ptr->data = type_var::float_literal_t{};
-                        return ptr;
-                    },
-                    [&](const expr_var::bool_literal_t& v) -> ref_type {
-                        auto ptr = allocator.alloc_one<type_t>();
-                        ptr->data = type_var::integer_literal_t{};
-                        return ptr;
-                    },
-                    [&](const expr_var::binary_op_t& v) -> ref_type {
-                        switch (v.op) {
-                        case expr_var::op_e::opadd:
-                        case expr_var::op_e::opdiv:
-                        case expr_var::op_e::opmul:
-                        case expr_var::op_e::opsub: {
-                            return v.lhs.deref().type;
-                        }
-                        case expr_var::op_e::opor:
-                        case expr_var::op_e::opand: {
-                            auto ptr = allocator.alloc_one<type_t>();
-                            ptr->data = type_var::integer_literal_t{};
-                            return ptr;
-                        }
-                        default:
-                            throw_error("TODO");
-                        }
-                    },
-                    // these 2 are basicaly operators
-                    [&](const expr_var::access_t& v) { return v.rhs.deref().type; },
-                    [&](const expr_var::call_t& v) {
-                        const auto callee_type = v.callee.deref().type;
-                        // DO NOT JUST LET IT THROW
-                        // FIX later i guess
-                        const auto& fntype =
-                            std::get<type_var::callable_t>(callee_type.deref().data);
-                        return fntype.ret_type;
-                    },
-
-                    [&](const expr_var::rec_init_t& v) -> ref_type { return v.type; },
-                    [&](const expr_var::name_t& v) -> ref_type {
-                        auto decl_type = type_of_decl(v.decl);
-                        if (!decl_type)
-                            throw_error("Declaration can't have a type");
-                        return decl_type.value();
-                    },
-                    [&](const expr_var::as_t& v) -> ref_type { return v.type; },
-                    [](auto& v) -> ref_type { return nullptr; },
-                },
-                var);
-        } // namespace ast
-
         void ptr_exit(ref_expr ptr) {
             auto& val = ptr.deref();
             if (!val.type) {
                 auto t = resolve_expr_type(this->allocator, val.data);
                 val.type = t;
             }
-
-            // if (!val.type) {
-            //     std::println("expr {} :: Still Needs resolving", ptr.as_void());
-            // } else {
-            //     // std::println("expr {} :: Has type", ptr.as_void());
-            // }
         }
     };
-    namespace SLOP {
 
+    namespace SLOP {
         static std::string default_name_resolver(std::uint32_t id) {
             return "id_" + std::to_string(id);
         }
@@ -3152,6 +3167,18 @@ namespace ast {
                 os << ' ';
                 print(v.body);
             }
+            void print_decl(const decl_t& d, const decl_var::efn_t& v) {
+                os << "external fn " << resolve(d.name) << '(';
+                for (size_t i = 0; i < v.args.size(); ++i) {
+                    if (i)
+                        os << ", ";
+                    print(v.args[i]);
+                }
+                os << ") -> ";
+                print(v.ret_type);
+                os << ' ';
+                os << v.external_symbol_name;
+            }
         };
 
         template <typename NameResolver>
@@ -3321,16 +3348,17 @@ namespace ast {
         };
     } // namespace SLOP
 
-    ref_stmts entry(allocator_t& allocator, const lexer::buffer& buffer) {
+    ref_stmts entry(allocator_t& allocator,
+                    const lexer::buffer& buffer,
+                    const llvm::DataLayout& data_layout) {
         auto& node = buffer.get_node(0);
         auto c = cursor{node.children()};
 
         ref scope = make_scope(allocator);
-        // auto root = allocator.alloc_one<ast_t>();
 
         // test_type_eq(allocator);
 
-        auto e = env{buffer, allocator, scope, /* root */};
+        auto e = env{buffer, data_layout, allocator, scope};
 
         auto file = node2ast::stmts_fn(e, c);
 
@@ -3539,54 +3567,13 @@ namespace codegen {
         return gen_type(u, ref.deref());
     }
 
-    llvm::Value*
-    gen_expr(unit& u, value_cache& cache, const ast::expr_var::int_literal_t& v) {
-        return nullptr;
-    }
-    llvm::Value*
-    gen_expr(unit& u, value_cache& cache, const ast::expr_var::float_literal_t& v) {
-        return nullptr;
-    }
-    llvm::Value*
-    gen_expr(unit& u, value_cache& cache, const ast::expr_var::bool_literal_t& v) {
-        return nullptr;
-    }
-    llvm::Value*
-    gen_expr(unit& u, value_cache& cache, const ast::expr_var::binary_op_t& v) {
-        return nullptr;
-    }
-    llvm::Value*
-    gen_expr(unit& u, value_cache& cache, const ast::expr_var::unary_op_t& v) {
-        return nullptr;
-    }
-    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::name_t& v) {
-        return nullptr;
-    }
-    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::block_t& v) {
-        return nullptr;
-    }
-    llvm::Value*
-    gen_expr(unit& u, value_cache& cache, const ast::expr_var::rec_init_t& v) {
-        return nullptr;
-    }
-    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::as_t& v) {
-        return nullptr;
-    }
-    llvm::Value*
-    gen_expr(unit& u, value_cache& cache, const ast::expr_var::bitcast_t& v) {
-        return nullptr;
-    }
-    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::access_t& v) {
-        return nullptr;
-    }
-    llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_var::call_t& v) {
+    llvm::Value* gen_expr(unit& u, value_cache& cache, const auto& v) {
         return nullptr;
     }
     llvm::Value*
     gen_expr(unit& u, value_cache& cache, const ast::expr_var::unresolved_t&) {
         throw_error("unresolved expr in codegen");
     }
-
     llvm::Value* gen_expr(unit& u, value_cache& cache, const ast::expr_t& e) {
         return std::visit([&](const auto& v) { return gen_expr(u, cache, v); }, e.data);
     }
@@ -3594,11 +3581,7 @@ namespace codegen {
         return gen_expr(u, cache, ref.deref());
     }
 
-    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_var::decl_wrap& v) {}
-    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_var::expr_wrap& v) {}
-    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_var::return_t& v) {}
-    void gen_stmt(unit& u, value_cache& cache, const ast::stmt_var::break_t& v) {}
-
+    void gen_stmt(unit& u, value_cache& cache, const auto& v) {}
     void gen_stmt(unit& u, value_cache& cache, const ast::stmt_t& s) {
         std::visit([&](const auto& v) { gen_stmt(u, cache, v); }, s.data);
     }
@@ -3606,31 +3589,7 @@ namespace codegen {
         gen_stmt(u, cache, ref.deref());
     }
 
-    void gen_decl(unit& u,
-                  value_cache& cache,
-                  const ast::decl_t&,
-                  const ast::decl_var::fn_t&) {}
-    void gen_decl(unit& u,
-                  value_cache& cache,
-                  const ast::decl_t&,
-                  const ast::decl_var::var_t&) {}
-    void gen_decl(unit& u,
-                  value_cache& cache,
-                  const ast::decl_t&,
-                  const ast::decl_var::type_alias_t&) {}
-    void gen_decl(unit& u,
-                  value_cache& cache,
-                  const ast::decl_t&,
-                  const ast::decl_var::rec_member_t&) {}
-    void gen_decl(unit& u,
-                  value_cache& cache,
-                  const ast::decl_t&,
-                  const ast::decl_var::fn_parameter_t&) {}
-    void gen_decl(unit& u,
-                  value_cache& cache,
-                  const ast::decl_t&,
-                  const ast::decl_var::tagged_union_member_t&) {}
-
+    void gen_decl(unit& u, value_cache& cache, const ast::decl_t&, const auto&) {}
     void gen_decl(unit& u, value_cache& cache, const ast::decl_t& d) {
         std::visit([&](const auto& v) { gen_decl(u, cache, d, v); }, d.data);
     }
@@ -3643,7 +3602,6 @@ namespace codegen {
         for (const auto& stmt : stmts.deref().span)
             gen_stmt(u, cache, stmt);
     }
-
 } // namespace codegen
 
 int main(int argc, char* argv[]) {
@@ -3659,6 +3617,9 @@ int main(int argc, char* argv[]) {
     std::string_view filepath = argv[1];
     lexer::intern_table intern_table;
 
+    auto llvm_unit = codegen::unit(filepath);
+    const auto pointer_size = llvm_unit.data_layout().getPointerSize();
+
     auto text = load_file(filepath);
     if (!text) [[unlikely]] {
         throw std::runtime_error(text.error());
@@ -3671,7 +3632,7 @@ int main(int argc, char* argv[]) {
     lexer::pretty_print(lexer_output, src);
 
     llvm_allocator arena;
-    auto file = ast::entry(arena, lexer_output);
+    auto file = ast::entry(arena, lexer_output, llvm_unit.data_layout());
 
     {
         // ast::ASTInspector inspector;
@@ -3683,7 +3644,6 @@ int main(int argc, char* argv[]) {
         slpp.print(file);
     }
     {
-        auto llvm_unit = codegen::unit(filepath);
 
         // codegen::gen_type(llvm_unit, );
     }
