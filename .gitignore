@@ -1,4 +1,4 @@
-# Prerequisites
+;# Prerequisites
 *.d
 
 # Compiled Object files
@@ -67,3 +67,6 @@ vcpkg_installed/
 Testing/
 .cache/
 .zed/
+
+build/
+notes.md

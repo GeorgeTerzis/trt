@@ -1,18 +1,25 @@
 // !! check the compile.sh to see how to compile !!
+//
+
+// TODO: I need to move to a better error handling system rather rather than exploding on
+// the first bump probably add an error state to each stage then lexer errors can be
+// detected by the ast and skiped till the next terminator and so on then at the end of
+// the AST stage we just  dump all the errors to the user.
+// ofcourse not every error is the same and we can't just accumilate and continiue for
+// every error but it is going to be a good start.
+// * insert blog post from the D programming language guy here about error handling*
+//
 
 #include "./file_loader.cpp"
 
-// #include "../include/utf8.h"
-#include "../include/utf8/checked.h"
-
 #include "../libs/llvm_allocator.hpp"
-#include "../libs/map.hpp"
 #include "../libs/meta.hpp"
 #include "../libs/ref.hpp"
 #include "../libs/staging_vec.hpp"
-#include "../libs/vector.hpp"
+#include "../libs/variant_overload.hpp"
 #include "./mutability.hpp"
-
+#include "lexer.hpp"
+#include "throw_error.hpp"
 #include <boost/pfr/core.hpp>
 #include <cassert>
 #include <cstddef>
@@ -23,15 +30,6 @@
 #include <format>
 #include <functional>
 #include <iostream>
-#include <llvm/ADT/APFloat.h>
-#include <llvm/ADT/APInt.h>
-#include <llvm/ADT/ArrayRef.h>
-#include <llvm/ADT/DenseMap.h>
-#include <llvm/ADT/SmallVector.h>
-#include <llvm/ADT/StringMapEntry.h>
-#include <llvm/ADT/StringRef.h>
-#include <llvm/ADT/StringSwitch.h>
-#include <llvm/ADT/Twine.h>
 #include <llvm/Analysis/TypeBasedAliasAnalysis.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/Constant.h>
@@ -57,7 +55,6 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
-// #include <memory_resource>
 #include <optional>
 #include <print>
 #include <span>
@@ -71,1096 +68,6 @@
 #include <vector>
 #include <wchar.h>
 
-#define become [[clang::musttail]] return
-
-template <typename... Func>
-struct overload : Func... {
-    using Func::operator()...;
-};
-template <typename... Func>
-overload(Func...) -> overload<Func...>;
-
-inline std::string source_location_to_string(const std::source_location& loc) {
-    char buffer[1024];
-    std::snprintf(buffer,
-                  sizeof(buffer),
-                  "%s:%u in %s",
-                  loc.file_name(),
-                  loc.line(),
-                  loc.function_name());
-    return std::string(buffer);
-}
-
-template <typename T>
-using list = llvm::SmallVector<T, 0>;
-
-using string_view = std::string_view;
-using string = std::string;
-
-using intern_id = std::uint32_t;
-
-[[noreturn]] auto
-throw_error(std::source_location loc = std::source_location::current()) {
-    std::println(std::cerr,
-                 "{} :: Throw without message",
-                 source_location_to_string(loc));
-    std::abort();
-}
-
-[[noreturn]] auto
-throw_error(std::string_view msg,
-            std::source_location loc = std::source_location::current()) {
-    std::println(std::cerr, "{} :: {}", source_location_to_string(loc), msg);
-    std::abort();
-}
-
-struct source {
-    string filename;
-    string text;
-
-    source(auto f, auto s) : filename(f), text(s) {}
-
-    source(const source&) = delete;
-    source& operator=(const source&) = delete;
-
-    // Allow move operations
-    source(source&&) noexcept = default;
-    source& operator=(source&&) noexcept = default;
-
-    operator string_view() const noexcept {
-        return text;
-    }
-
-    const char* data() const noexcept {
-        return text.data();
-    }
-    size_t size() const noexcept {
-        return text.size();
-    }
-    bool empty() const noexcept {
-        return text.empty();
-    }
-
-    char operator[](size_t i) const {
-        return text[i];
-    }
-
-    string_view substr(size_t pos = 0, size_t count = string_view::npos) const {
-        size_t len = std::min(count, text.size() - pos);
-        return string_view(text.data() + pos, len);
-    }
-
-    auto begin() const noexcept {
-        return text.begin();
-    }
-    auto end() const noexcept {
-        return text.end();
-    }
-};
-using source_view = source&;
-
-struct final {
-    enum e {
-        first,
-#define TOKEN_BASE(code) code,
-#include "./def"
-        last,
-    };
-    e code;
-    uint32_t data = 0; // IDs use it for names
-
-    explicit final(e c) : code(c) {}
-    explicit final(e c, uint32_t d) : code(c), data(d) {}
-
-    operator e() const {
-        return code;
-    }
-
-    bool operator==(e other) const {
-        return code == other;
-    }
-};
-using finale = final::e;
-
-struct node;
-struct median;
-struct final;
-
-struct median {
-    enum e {
-        final,
-        FILE,
-        PARENS,
-        BRACES,
-        CBRACES,
-        BLOCK_EXPR,
-        DECL,
-        last,
-    };
-
-    e code;
-    std::uint32_t len;
-    explicit median(e c, std::uint16_t l) : code(c), len(l) {}
-
-    inline std::span<node> children();
-
-    inline std::span<const node> children() const;
-
-    bool operator==(e other) const {
-        return code == other;
-    }
-};
-
-struct node {
-    union u {
-        final final;
-        median median;
-    };
-
-    enum class e {
-        FINAL,
-        MEDIAN,
-    };
-
-    u payload;
-    e tag;
-
-    explicit node(median::e v, std::uint16_t c) :
-        payload{.median = median{v, c}},
-        tag{e::MEDIAN} {}
-    explicit node(final::e v, uint32_t d) :
-        payload{.final = final{v, d}},
-        tag{e::FINAL} {}
-    explicit node(final::e v) : payload{.final = final{v}}, tag{e::FINAL} {}
-
-    explicit node(final m) : payload{.final = m}, tag{e::FINAL} {}
-    explicit node(median m) : payload{.median = m}, tag{e::MEDIAN} {}
-
-    decltype(auto) unsafe_final(this auto&& self) {
-        return (self.payload.final);
-    }
-    decltype(auto) unsafe_median(this auto&& self) {
-        return (self.payload.median);
-    }
-
-    template <typename FinalFn, typename MedianFn, typename... Args>
-    decltype(auto)
-    visit(this auto&& self, FinalFn&& final_arm, MedianFn&& median_arm, Args&&... args)
-        requires std::is_invocable_v<FinalFn,
-                                     decltype(std::forward<decltype(self)>(self)
-                                                  .unsafe_final()),
-                                     Args...> &&
-                 std::is_invocable_v<MedianFn,
-                                     decltype(std::forward<decltype(self)>(self)
-                                                  .unsafe_median()),
-                                     Args...>
-    {
-        switch (self.tag) {
-        case e::FINAL:
-            return std::forward<FinalFn>(final_arm)(
-                std::forward<decltype(self)>(self).unsafe_final(),
-                std::forward<Args>(args)...);
-
-        case e::MEDIAN:
-            return std::forward<MedianFn>(median_arm)(
-                std::forward<decltype(self)>(self).unsafe_median(),
-                std::forward<Args>(args)...);
-
-        default:
-            throw_error(
-                "While visiting node found something that is not a final or a median");
-            // std::unreachable();
-        }
-    }
-
-    template <typename T>
-    decltype(auto) unsafe_get(this auto&& self) {
-        if constexpr (std::is_same_v<T, final>)
-            return self.unsafe_final();
-        if constexpr (std::is_same_v<T, median>)
-            return self.unsafe_median();
-        else
-            static_assert(false, "Invalid alternative");
-    }
-
-    auto as_final(this auto&& self) {
-        using value_t = std::remove_reference_t<decltype(self.unsafe_final())>;
-
-        using ref_t =
-            std::conditional_t<std::is_const_v<std::remove_reference_t<decltype(self)>>,
-                               const value_t,
-                               value_t>;
-
-        if (self.tag != e::FINAL)
-            return std::optional<std::reference_wrapper<ref_t>>{};
-
-        return std::optional<std::reference_wrapper<ref_t>>{self.unsafe_final()};
-    }
-
-    auto as_median(this auto&& self) {
-        using value_t = std::remove_reference_t<decltype(self.unsafe_median())>;
-
-        using ref_t =
-            std::conditional_t<std::is_const_v<std::remove_reference_t<decltype(self)>>,
-                               const value_t,
-                               value_t>;
-
-        if (self.tag != e::MEDIAN)
-            return std::optional<std::reference_wrapper<ref_t>>{};
-
-        return std::optional<std::reference_wrapper<ref_t>>{self.unsafe_median()};
-    }
-
-    template <typename T_>
-    auto safe_get(this auto&& self) {
-        using T = std::remove_cvref_t<T_>;
-        static_assert(std::is_same_v<T, final> || std::is_same_v<T, median>,
-                      "Invalid node_t alternative");
-
-        if constexpr (std::is_same_v<T, final>)
-            return self.as_final();
-        else
-            return self.as_median();
-    }
-
-    inline std::span<node> children();
-    inline std::span<const node> children() const;
-
-    bool isa(final::e v) const {
-        if (tag == e::FINAL && unsafe_final() == v)
-            return true;
-        return false;
-    }
-    bool isa(median::e v) const {
-        if (tag == e::MEDIAN && unsafe_median() == v)
-            return true;
-        return false;
-    }
-};
-
-inline std::span<const node> median::children() const {
-    auto n = reinterpret_cast<const node*>(this) + 1;
-    return {n, n + this->len};
-}
-
-inline std::span<node> median::children() {
-    auto n = reinterpret_cast<node*>(this) + 1;
-    return {n, n + this->len};
-}
-
-inline std::span<const node> node::children() const {
-    return this->visit(
-        [](const final&) -> std::span<const node> { return {}; },
-        [](const median& m) -> std::span<const node> { return m.children(); });
-}
-
-inline std::span<node> node::children() {
-    return this->visit([](final&) -> std::span<node> { return {}; },
-                       [](median& m) -> std::span<node> { return m.children(); });
-}
-
-template <typename ElmT>
-struct cursor_base_t {
-
-    using value_type = ElmT;
-    using difference_type = std::ptrdiff_t;
-    using pointer = ElmT*;
-    using reference = ElmT&;
-    using iterator_category = std::forward_iterator_tag;
-    using iterator_concept = std::forward_iterator_tag;
-
-    pointer cursor;
-    pointer end;
-
-    cursor_base_t() = default;
-    explicit cursor_base_t(pointer b, pointer e) : cursor{b}, end{e} {};
-    explicit cursor_base_t(std::span<ElmT> span) :
-        cursor{span.begin().base()},
-        end{span.end().base()} {};
-
-    decltype(auto) get(this auto&& self) {
-        return *self.cursor;
-    }
-
-    bool within() const {
-        return cursor < end;
-    }
-
-    reference operator*() const noexcept {
-        return *cursor;
-    }
-    pointer operator->() const noexcept {
-        return cursor;
-    }
-
-    cursor_base_t& operator++() {
-        cursor = next();
-        return *this;
-    }
-
-    cursor_base_t operator++(int) {
-        cursor_base_t tmp = *this;
-        ++(*this);
-        return tmp;
-    }
-
-    bool operator==(const cursor_base_t& other) const {
-        return cursor == other.cursor;
-    }
-    bool operator!=(const cursor_base_t& other) const {
-        return !(*this == other);
-    }
-
-    pointer next() const {
-        const auto ptr = cursor;
-        const auto jump_offset =
-            ptr->visit([](const final&) -> difference_type { return 1; },
-                       [](const median& v) -> difference_type { return v.len + 1; });
-        return ptr + jump_offset;
-    }
-};
-// using cursor_t = cursor_base_t<node>;
-using const_cursor_t = cursor_base_t<const node>;
-
-struct source_location {
-    std::uint32_t line;
-    std::uint32_t begin_index;
-    std::uint32_t end_index;
-
-    source_location(std::uint32_t line, std::uint32_t begin, std::uint32_t end) :
-        line(line),
-        begin_index(begin),
-        end_index(end) {}
-
-    auto length() const {
-        return end_index - begin_index;
-    }
-
-    string_view source(string_view src) const {
-        if (begin_index <= end_index)
-            return string_view(src.begin() + begin_index, src.begin() + end_index);
-        else
-            return "";
-    }
-};
-
-namespace lexer {
-    struct intern_table {
-        llvm::DenseMap<llvm::StringRef, uint32_t> map;
-        uint32_t current_id = 0;
-
-        uint32_t intern(std::string_view s) {
-            auto [it, inserted] = map.try_emplace(s, current_id);
-            if (inserted)
-                ++current_id;
-
-            return it->second;
-        }
-
-        std::string_view lookup(uint32_t id) const {
-            for (auto& [key, val] : map)
-                if (val == id)
-                    return key;
-            return {};
-        }
-    };
-
-    struct buffer {
-        intern_table& itable;
-        source& src;
-
-        list<node> nodes;
-        list<source_location> locs;
-
-        std::uint32_t to_index(const node* n) const {
-            auto res = n - nodes.begin();
-            return static_cast<size_t>(res);
-        }
-
-        std::uint32_t to_index(const source_location* n) const {
-            auto res = n - locs.begin();
-            return static_cast<size_t>(res);
-        }
-
-        inline decltype(auto) loc(this auto&& self, std::uint32_t index) {
-            return self.locs[index];
-        }
-
-        inline decltype(auto) get_node(this auto&& self, std::uint32_t index) {
-            return self.nodes[index];
-        }
-
-        inline decltype(auto) push(node&& n, source_location&& loc) {
-            auto& it = nodes.emplace_back(n);
-            locs.push_back(loc);
-            return &it - nodes.begin();
-        }
-
-        std::string_view str(intern_id id) const {
-            return itable.lookup(id);
-        }
-        std::string_view str(source_location loc) const {
-            return loc.source(src.text);
-        }
-        std::string_view str(const node* node) const {
-            auto index = to_index(node);
-            auto location = loc(index);
-            return str(location);
-        }
-    };
-
-    struct buffer_builder {
-        buffer& out;
-
-        inline auto push(node n, source_location s) {
-            return out.push(std::move(n), std::move(s));
-        }
-    };
-
-    struct unit {
-        struct symetrical_entry {
-            median::e code;
-            std::uint32_t index;
-        };
-
-        buffer_builder buffer;
-
-        list<symetrical_entry> openstack = {};
-
-        uint32_t line = 1;
-        uint32_t depth = 0;
-        uint32_t last_terminator_depth = 0;
-        uint32_t prev_depth = 0; // tracks per open and close
-    };
-
-#define RET void
-#define ARGS unit &u, source_view src, const uint32_t token_begin, uint32_t cursor
-#define FNSIG (ARGS)->RET
-
-    using dispatch_table = std::array<RET (*)(ARGS), 256>;
-    using truth_table = std::array<bool, 256>;
-
-    auto within_src(string_view src, std::uint32_t index) {
-        return src.size() > index;
-    }
-
-    auto next FNSIG;
-
-    auto peek(source_view src, std::uint32_t cursor) -> unsigned char {
-        if (!within_src(src, cursor + 1))
-            return 0;
-        return static_cast<unsigned char>(src[cursor + 1]);
-    }
-
-    constexpr string_view str(final::e e) {
-        switch (e) {
-#define TOKEN_BASE(code)                                                                 \
-    case final::code:                                                                    \
-        return #code;
-#include "./def"
-        case final::first:
-            return "first";
-        case final::last:
-            return "last";
-            break;
-        }
-    }
-
-    constexpr string_view str(median::e e) {
-        switch (e) {
-        case median::e::FILE:
-            return "FILE";
-        case median::e::PARENS:
-            return "PARENS";
-        case median::e::BRACES:
-            return "BRACES";
-        case median::e::CBRACES:
-            return "CBRACES";
-        case median::e::BLOCK_EXPR:
-            return "BLOCK_EXPR";
-        case median::e::DECL:
-            return "DECL";
-        default:
-            return "UNKNOWN";
-        }
-    }
-
-    string str(const source_location val) {
-        return std::format("loc={{line={}, len={}, index={}}}",
-                           val.line,
-                           val.length(),
-                           val.begin_index);
-    }
-    string str(const final val) {
-        return std::format("final={{code={}}}", str(val.code));
-    }
-    string str(const median val) {
-        return std::format("median={{code={}, len={}}}", str(val.code), val.len);
-    }
-    string str(const node& val) {
-        return std::format("node={{{}}}",
-                           val.visit([&](const final& f) { return str(f); },
-                                     [&](const median& f) { return str(f); }));
-    }
-    string str(const node& n, const lexer::buffer& buffer) {
-        auto buffer_index = buffer.to_index(&n);
-        return std::format("[{}]{}, {}",
-                           buffer_index,
-                           str(n),
-                           str(buffer.loc(buffer_index)));
-    }
-
-    namespace whitesapce {
-        constexpr bool is_vertical(unsigned char c) {
-            return (c == '\n') || (c == '\r');
-        }
-
-        constexpr bool is_horizontal(unsigned char c) {
-            return (c == ' ') || (c == '\t');
-        }
-
-        auto horizontal FNSIG {
-            auto end = cursor;
-            while (within_src(src, end) && is_horizontal(src[end]))
-                ++end;
-            become next(u, src, end, end);
-        }
-        auto vertical FNSIG {
-            ++u.line;
-            become next(u, src, token_begin + 1, cursor + 1);
-        }
-    } // namespace whitesapce
-
-    node get_terminator() {
-        return node{final::TERMINATOR};
-    }
-
-    std::uint32_t open_median(unit& u,
-                              median::e code,
-                              string_view src,
-                              std::uint32_t token_begin,
-                              std::uint32_t cursor);
-    auto
-    close_median(std::uint32_t index, unit& u, string_view src, std::uint32_t cursor);
-
-    void make_terminator(unit& u,
-                         source_view src,
-                         const uint32_t& token_begin,
-                         uint32_t& end) {
-        u.last_terminator_depth = u.depth;
-        u.buffer.push(get_terminator(), source_location{u.line, token_begin, end});
-    }
-    auto terminator FNSIG {
-        auto end = cursor + 1;
-        make_terminator(u, src, token_begin, end);
-
-        become next(u, src, end, end);
-    }
-
-    // void cond_insert_invisible_separator(unit& u) {
-    //     auto& last_node = u.buffer.out.nodes.back();
-    //     auto& last_loc = u.buffer.out.locs.back();
-
-    //     last_node.visit(
-    //         [&](const final& f) {
-    //             auto loc = last_loc;
-    //             loc.end_index = 0;
-
-    //             bool depth_equal = (u.last_terminator_depth == u.depth - 1);
-    //             bool is_terminator = (f == final::TERMINATOR);
-
-    //             u.buffer.push(get_terminator(), loc);
-    //             // if (u.prev_depth != u.last_terminator_depth) {
-    //             //     u.last_terminator_depth = u.depth;
-
-    //             //     u.buffer.push(get_terminator(), loc);
-    //             // } else if (skip) {
-    //             // } else if (depth_equal && !is_terminator) {
-    //             //     u.last_terminator_depth = u.depth;
-
-    //             //     u.buffer.push(get_terminator(), loc);
-    //             // } else if (!depth_equal) {
-    //             //     u.last_terminator_depth = u.depth;
-
-    //             // }
-    //         },
-    //         [](const median&) {});
-    // }
-
-    std::uint32_t open_median(unit& u,
-                              median::e code,
-                              string_view src,
-                              std::uint32_t token_begin,
-                              std::uint32_t cursor) {
-
-        auto loc = source_location{u.line, token_begin, token_begin + 1};
-        auto index = u.buffer.push(node(code, 0), loc);
-        u.prev_depth = u.depth;
-        ++u.depth;
-        return index;
-    }
-
-    auto
-    close_median(std::uint32_t index, unit& u, string_view src, std::uint32_t cursor) {
-        {
-            auto& open_node = u.buffer.out.get_node(index);
-            auto& m = open_node.payload.median;
-            m.len = u.buffer.out.nodes.size() - 1 - index;
-        }
-
-        {
-            auto& open_source_location = u.buffer.out.loc(index);
-            open_source_location.end_index = cursor;
-        }
-        u.prev_depth = u.depth;
-        --u.depth;
-    }
-
-    namespace symmetrical {
-
-        template <median::e code>
-        auto open FNSIG {
-            auto index = open_median(u, code, src, token_begin, cursor);
-            u.openstack.push_back({code, index});
-
-            ++cursor;
-            become next(u, src, cursor, cursor);
-        }
-
-        auto symetrical_close_match(median::e code, char close_char) {
-            switch (code) {
-            case median::e::PARENS:
-                return close_char == ')';
-            case median::e::BRACES:
-                return close_char == ']';
-            case median::e::CBRACES:
-                return close_char == '}';
-            default:
-                return false;
-            }
-        }
-
-        auto close FNSIG {
-            auto c = src[cursor];
-            cursor += 1;
-
-            auto open_index = u.openstack.back();
-            u.openstack.pop_back();
-
-            if (!symetrical_close_match(open_index.code, c)) [[unlikely]]
-                std::abort();
-
-            auto prev_non_whitespace = [&]() -> unsigned char {
-                auto i = cursor - 2;
-                while (i > 0 && (whitesapce::is_horizontal(src[i]) ||
-                                 whitesapce::is_vertical(src[i])))
-                    --i;
-                return static_cast<unsigned char>(src[i]);
-            };
-
-            if (prev_non_whitespace() != ';') {
-                auto loc = u.buffer.out.locs.back();
-                loc.end_index = 0;
-                u.buffer.push(get_terminator(), loc);
-                u.last_terminator_depth = u.depth;
-            }
-
-            close_median(open_index.index, u, src, cursor);
-            return next(u, src, cursor, cursor);
-        }
-    } // namespace symmetrical
-
-    auto strlit FNSIG {
-        ++cursor;
-        while (within_src(src, cursor) && src[cursor] != '\"')
-            ++cursor;
-        auto end = cursor + 1;
-        auto loc = source_location{u.line, token_begin, cursor};
-        u.buffer.push(node(final(final::STRING_LIT)), loc);
-
-        become next(u, src, end, end);
-    }
-
-    constexpr bool is_digit(unsigned char c) {
-        return (c >= '0' && c <= '9');
-    }
-
-    constexpr bool ascii_is_alpha(unsigned char c) {
-        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-    }
-
-    constexpr bool ascii_is_id_start(unsigned char c) {
-        return ascii_is_alpha(c) || c == '_';
-    }
-
-    constexpr bool ascii_is_ident_continue(unsigned char c) {
-        return ascii_is_id_start(c) || is_digit(c);
-    }
-
-    inline string_view read_word(source_view src, const std::uint32_t begin_index) {
-        const auto begin = src.begin() + begin_index;
-        auto cursor = begin;
-        const auto end = src.end();
-        do {
-            unsigned char c = *cursor;
-            if (c > 128) {
-                utf8::next(cursor, end);
-            } else if (ascii_is_ident_continue(c)) {
-                ++cursor;
-            } else {
-                break;
-            }
-        } while (cursor < end);
-
-        return std::string_view(begin, cursor);
-    }
-
-    auto keyword FNSIG {
-        auto word = read_word(src, token_begin);
-        auto end = token_begin + word.size();
-
-        auto type = llvm::StringSwitch<final::e>(word).
-#define KEYWORD(spelling, code) Case(spelling, final::code).
-#include "def"
-                    Default(final::ID);
-
-        // if(type == final::ID){
-        //     auto intern_id = u.buffer.out.itable.intern(word);
-
-        // }
-
-        u.buffer.push(
-            node(type, ((type == final::ID) ? u.buffer.out.itable.intern(word) : 0)),
-            source_location{u.line, token_begin, static_cast<uint32_t>(end)});
-        become next(u, src, end, end);
-    }
-
-    auto id FNSIG {
-        auto word = read_word(src, token_begin);
-        auto end = token_begin + word.size();
-        auto intern_id = u.buffer.out.itable.intern(word);
-
-        u.buffer.push(node(final::ID, intern_id),
-                      source_location{u.line, token_begin, static_cast<uint32_t>(end)});
-        become next(u, src, end, end);
-    }
-
-    inline bool all_digits(std::string_view v) {
-        return !v.empty() &&
-               std::ranges::all_of(v, [](unsigned char c) { return is_digit(c); });
-    }
-
-    auto prefixed_numeric_or_id FNSIG {
-        auto text = read_word(src, token_begin);
-        cursor += text.size();
-        auto loc = source_location{u.line, token_begin, cursor};
-
-        auto is_digit_pred = [](unsigned char c) { return is_digit(c); };
-
-        const auto len_view = text.substr(1);
-        if (text.size() >= 2 && std::ranges::all_of(len_view, is_digit_pred)) {
-            const auto prefix = text[0];
-            final::e type = final::last;
-            switch (prefix) {
-            case 's':
-                type = final::SINT_TYPE;
-                break;
-            case 'u':
-                type = final::UINT_TYPE;
-                break;
-            case 'b':
-                type = final::BOOL_TYPE;
-                break;
-            default:
-                std::unreachable();
-            }
-
-            std::uint32_t len;
-            std::from_chars(len_view.data(), len_view.data() + len_view.size(), len);
-            u.buffer.push(node(final{type, len}), loc);
-            become next(u, src, cursor, cursor);
-        }
-
-        become keyword(u, src, token_begin, cursor);
-    }
-
-    auto num FNSIG {
-        auto i = token_begin;
-        final::e fintype = final::INT;
-
-        while (i < src.size() && is_digit(static_cast<unsigned char>(src[i]))) {
-            ++i;
-        }
-
-        if (i < src.size() && src[i] == '.') {
-            fintype = final::FLOAT;
-            ++i;
-
-            while (i < src.size() && is_digit(src[i])) {
-                ++i;
-            }
-        }
-        if (i < src.size() && (src[i] == 'e')) {
-            fintype = final::FLOAT;
-            ++i;
-
-            if (i < src.size() && (src[i] == '-'))
-                ++i;
-
-            while (i < src.size() && is_digit(src[i]))
-                ++i;
-        }
-
-        auto loc = source_location{u.line, token_begin, i};
-        u.buffer.push(node(final{fintype}), loc);
-
-        become next(u, src, i, i);
-    }
-
-    [[noreturn]] auto unreachable_state FNSIG {
-        std::unreachable();
-    }
-
-    constexpr auto symbol_sequence_table = [] consteval {
-        truth_table table = {false};
-        for (int i = 0; i < 256; i++)
-            table[i] = false;
-
-#define SYMBOL_SEQUENCE(spelling, code)                                                  \
-    for (std::uint32_t i = 0; i < sizeof(spelling); ++i)                                 \
-        table[spelling[i]] = true;
-#include "./def"
-
-        return table;
-    }();
-    constexpr auto id_start_table = [] consteval {
-        truth_table table = {false};
-        for (char c = 'A'; c <= 'Z'; ++c)
-            table[c] = true;
-        for (char c = 'a'; c <= 'z'; ++c)
-            table[c] = true;
-        table['_'] = true;
-        return table;
-    }();
-    constexpr auto id_inner_table = [] consteval {
-        truth_table table = id_start_table;
-        for (char c = '0'; c <= '9'; ++c)
-            table[c] = true;
-        return table;
-    }();
-    constexpr auto builtin_table = [] consteval {
-        truth_table table = id_inner_table;
-        table['*'] = true;
-        return table;
-    }();
-
-    [[clang::always_inline]] inline auto scan_for_symbol(string_view src,
-                                                         std::uint32_t cursor)
-        -> string_view {
-        while (within_src(src, cursor) && symbol_sequence_table[src[cursor]])
-            ++cursor;
-        return src.substr(0, cursor);
-    }
-
-    template <auto table>
-    [[clang::always_inline]] inline auto scan_for(std::string_view src,
-                                                  std::uint32_t cursor)
-        -> std::string_view {
-        while (within_src(src, cursor) && table[src[cursor]])
-            ++cursor;
-        return src.substr(0, cursor);
-    }
-
-    auto symbol FNSIG {
-        const auto text = scan_for<symbol_sequence_table>(src.substr(cursor), 0);
-        cursor += text.size();
-
-        // empty text something has failed
-        if (text.size() == 0) [[unlikely]]
-            std::abort();
-
-        auto subbegin = text.begin();
-        auto len = text.size();
-
-        do {
-            const auto view = llvm::StringRef(subbegin, len);
-            const auto r = llvm::StringSwitch<final::e>(view)
-#define SYMBOL_SEQUENCE(spelling, code) .Case(spelling, final::code)
-#include "./def"
-                               .Default(final::last);
-
-            if (r == final::e::last) [[unlikely]] {
-                len--;
-                cursor--;
-                if (len == 0) [[unlikely]]
-                    std::abort();
-            } else {
-                u.buffer.push(node(final(r)),
-                              source_location{u.line, token_begin, cursor});
-                become next(u, src, cursor, cursor);
-            }
-        } while (true);
-    }
-
-    auto builtin FNSIG {
-        cursor++;
-        const auto word = scan_for<builtin_table>(src.substr(cursor), 0);
-        auto end = cursor + word.size();
-
-#define BUILTIN_KEYWORD(spelling, code) .Case(spelling, final::e::code)
-        auto code =
-            llvm::StringSwitch<final::e>(string_view(word.begin() - 1, word.size() + 1))
-#include "./def"
-                .Default(final::e::last);
-
-        if (code == final::e::last) [[unlikely]]
-            throw_error(std::format("Unknown builtin '@{}'", std::string_view(word)));
-
-        u.buffer.push(node(final(code)),
-                      source_location{u.line, token_begin, static_cast<uint32_t>(end)});
-
-        become next(u, src, end, end);
-    }
-
-    auto line_comment FNSIG {
-        // disambiguate '/' (divide) vs '//' (comment)
-        if (!within_src(src, cursor + 1) || src[cursor + 1] != '/') {
-            become symbol(u, src, token_begin, cursor);
-        }
-        cursor += 2; // skip '//'
-        while (within_src(src, cursor) && !whitesapce::is_vertical(src[cursor]))
-            ++cursor;
-        become next(u, src, cursor, cursor);
-    }
-
-    constexpr inline bool is_id_continue_ascii(unsigned char c) {
-        return id_inner_table[c];
-    }
-
-    constexpr auto next_table = [] consteval {
-        dispatch_table table = {unreachable_state};
-
-        table['@'] = builtin;
-        table[';'] = terminator;
-
-#define SYMBOL_SEQUENCE(spelling, code) table[spelling[0]] = symbol;
-#include "./def"
-
-        {
-            table['('] = symmetrical::open<median::e::PARENS>;
-            table[')'] = symmetrical::close;
-
-            table['['] = symmetrical::open<median::e::BRACES>;
-            table[']'] = symmetrical::close;
-
-            table['{'] = symmetrical::open<median::e::CBRACES>;
-            table['}'] = symmetrical::close;
-        }
-
-        for (unsigned int i = 0; i < 256; ++i) {
-            if (whitesapce::is_horizontal(i))
-                table[i] = whitesapce::horizontal;
-            else if (whitesapce::is_vertical(i))
-                table[i] = whitesapce::vertical;
-            else if (is_digit(i))
-                table[i] = num;
-            else if (ascii_is_id_start(i))
-                table[i] = id;
-        }
-
-        for (unsigned i = 128; i < 256; ++i)
-            table[i] = id;
-
-#define KEYWORD(spelling, code) table[spelling[0]] = keyword;
-#include "def"
-        table['s'] = prefixed_numeric_or_id;
-        table['u'] = prefixed_numeric_or_id;
-        table['b'] = prefixed_numeric_or_id;
-
-        table['/'] = line_comment;
-        table['\"'] = strlit;
-        return table;
-    }();
-
-    auto next FNSIG {
-        if (!within_src(src, cursor))
-            return;
-
-        const auto c = static_cast<unsigned char>(src[cursor]);
-        become next_table[c](u, src, token_begin, cursor);
-    }
-
-    auto close_file_median(unit& u, string_view src) {
-        // cond_insert_invisible_separator(u);
-        close_median(0, u, src, src.size());
-    }
-
-    std::string format_node_text(const buffer& b, const node& n) {
-        const auto buffer_index = b.to_index(&n);
-        const auto loc = b.loc(buffer_index);
-        const auto text = loc.source(b.src);
-
-        const auto fin_text =
-            (n.as_final() && text.size()) ? "'" + std::string(text) + "'" : "";
-
-        return std::format("[{}]{} {}", buffer_index, str(n), fin_text);
-    }
-
-    void internal_pretty_print(const buffer& b,
-                               source_view src,
-                               const_cursor_t i,
-                               std::uint32_t&& depth) {
-        constexpr int depth_mul = 4;
-        constexpr int value_width = 30;
-
-        const string indent_str(depth * depth_mul, ' ');
-
-        while (i.within()) {
-            const auto& n = i++.get();
-
-            std::println("{}{}", indent_str, format_node_text(b, n));
-            n.visit([&](const final&) {},
-                    [&](const median& v) {
-                        internal_pretty_print(b,
-                                              src,
-                                              cursor_base_t<const node>(v.children()),
-                                              depth + 1);
-                    });
-        }
-    }
-
-    void pretty_print(const buffer& buf, source_view src) {
-        std::span<const node> s(&buf.get_node(0), 1);
-        auto i = const_cursor_t(s);
-        internal_pretty_print(buf, src, i, 0);
-        std::println("\n");
-        return;
-    }
-
-    buffer entry(source& src, intern_table& itable) {
-        buffer buffer{
-            .itable = itable,
-            .src = src,
-            .nodes = {},
-            .locs = {},
-        };
-        buffer_builder builder{buffer};
-        unit u{builder};
-
-        open_median(u, median::e::FILE, src, 0, 0);
-        next(u, src, 0, 0);
-        close_median(0, u, src, src.size());
-
-        assert(!u.openstack.size());
-
-        return buffer;
-    }
-
-#undef FNSIG
-#undef ARGS
-#undef RET
-} // namespace lexer
-
 namespace ast {
     // One of the biggest problems (not so much of a problem but there is a fix to it)
     // is the reallocation of stateless types, like uint, sint, floating, void, opaque...
@@ -1171,6 +78,7 @@ namespace ast {
     // decide to allow multiple files it is just going to complicate things.
 
     using cursor = const_cursor_t;
+    using intern_id = lexer::intern_id;
 
     struct decl_t;
     struct type_t;
@@ -1195,7 +103,7 @@ namespace ast {
         };
 
         ref_scope parent;
-        map<intern_id, entry_t> table = {};
+        std::flat_map<intern_id, entry_t> table = {};
 
         template <bool is_local>
         static std::optional<lookup_result> lookup_impl(ref_scope& self, intern_id key) {
@@ -1268,7 +176,7 @@ namespace ast {
             ref_expr init_expr;
         };
 
-        struct var_infer {
+        struct var_infer_t {
             ref_expr init_expr;
         };
 
@@ -1317,6 +225,7 @@ namespace ast {
         using callable = type_list<fn_t, efn_t>;
 
         using variant = std::variant<var_t,
+                                     var_infer_t,
                                      rec_member_t,
                                      tagged_union_member_t,
                                      fn_parameter_t,
@@ -1362,9 +271,11 @@ namespace ast {
         struct unresolved_t {
             util::unresolved_name name;
         };
+
         struct block_t {
             util::frame frame;
         };
+
         struct int_literal_t {
             std::uint64_t value;
         };
@@ -1386,6 +297,16 @@ namespace ast {
         // struct call_payload_t {
         //     std::span<ref_expr> args;
         // };
+
+        struct match_t {
+            struct arm_t {
+                ref_expr value;
+                ref_expr body;
+            };
+
+            ref_expr value;
+            std::span<arm_t> arms;
+        };
 
         struct call_t {
             ref_expr callee;
@@ -1547,6 +468,15 @@ namespace ast {
             ref_type ret_type;
         };
 
+        struct enum_t {};
+        struct variant_t {
+            ref_scope scope;
+        };
+        struct tagged_variant_t {
+            ref_type enum_tag;
+            ref_scope scope;
+        };
+
         using variant = std::variant<unresolved_t,
                                      callable_t,
                                      type_alias_t,
@@ -1690,6 +620,7 @@ namespace ast {
             c++;
         }
     }
+
     template <final::e tok>
     void consume_untill(cursor& c) {
         while (c.within() && !c.get().isa(tok)) {
@@ -1729,45 +660,42 @@ namespace ast {
 
         return mem;
     }
-
-    ref_scope scope_of_type(const ref_type& ptr);
-    ref_scope scope_of_decl(const ref_decl& ptr);
-    ref_scope scope_of_expr(const ref_expr& ptr);
-
+    using maybe_ref_scope = std::optional<ref_scope>;
+    maybe_ref_scope scope_of(const ref_type& ptr);
+    maybe_ref_scope scope_of(const ref_decl& ptr);
+    maybe_ref_scope scope_of(const ref_expr& ptr);
     ref_scope scope_of(const type_var::rec_t& v) {
         return v.scope;
     }
 
-    ref_scope scope_of(const type_var::type_alias_t& v) {
-        return scope_of_type(v.type);
+    maybe_ref_scope scope_of(const type_var::type_alias_t& v) {
+        return scope_of(v.type);
     }
-
-    ref_scope scope_of(const type_var::ptr_t& v) {
-        return scope_of_type(v.type);
-    }
-
     template <typename T>
-    ref_scope scope_of(const T&) {
-        throw_error(std::format("Cannot get scope of type {}", type_str<T>()));
+    maybe_ref_scope scope_of(const T&) {
+        return std::nullopt;
     }
 
-    ref_scope scope_of_expr(const ref_expr& ptr) {
+    maybe_ref_scope scope_of(const type_var::ptr_t& v) {
+        return scope_of(v.type);
+    }
+
+    maybe_ref_scope scope_of(const ref_expr& ptr) {
         return std::visit(
-            overload{[](const expr_var::name_t& v) { return scope_of_decl(v.decl); },
-                     [](auto& v) -> ref_scope {
-                         throw_error("Can't get scope from this expresion");
-                     }},
+            overload{[](const expr_var::name_t& v) { return scope_of(v.decl); },
+                     [](auto& v) -> maybe_ref_scope { return std::nullopt; }},
             ptr.deref().data);
     }
-    ref_scope scope_of_type(const ref_type& ptr) {
-        return std::visit([](const auto& v) { return scope_of(v); }, ptr.deref().data);
+    maybe_ref_scope scope_of(const ref_type& ptr) {
+        return std::visit([](const auto& v) -> maybe_ref_scope { return scope_of(v); },
+                          ptr.deref().data);
     }
 
-    ref_scope scope_of_decl(const ref_decl& ptr) {
+    maybe_ref_scope scope_of(const ref_decl& ptr) {
         return std::visit(
             overload{
-                [](const decl_var::type_alias_t& v) { return scope_of_type(v.type); },
-                [](const auto&) -> ref_scope {
+                [](const decl_var::type_alias_t& v) { return scope_of(v.type); },
+                [](const auto&) -> maybe_ref_scope {
                     throw_error("Cannot get scope of non-type decl");
                 },
             },
@@ -1929,7 +857,8 @@ namespace ast {
         }
 
         ref_type type_fn(env e, cursor& c);
-        ref_expr expr_fn(env e, cursor& c, int min_prec = 0);
+        ref_expr expr_fn(env e, cursor& c);
+        ref_expr expr_fn_(env e, cursor& c, int min_prec);
         ref_stmts stmts_fn(env e, cursor& c);
 
         util::field_token field_token(env e, cursor& c) {
@@ -2052,8 +981,6 @@ namespace ast {
                     const auto& v = c.get();
                     if (v.isa(median::PARENS))
                         return expr_var::op_e::opcall;
-                    // else if (v.isa(final::DCOLON))
-                    //         return expr_var::op_e::opaccess;
                     else if (v.isa(final::PLUS))
                         return expr_var::op_e::opadd;
                     else if (v.isa(final::MINUS))
@@ -2094,7 +1021,7 @@ namespace ast {
                 ref_expr infix(env e, cursor& c, ref_expr lhs, expr_var::op_e op) {
                     c++;
                     const auto meta = expr_var::op_meta(op);
-                    ref_expr rhs = expr_fn(e, c, expr_var::right_bp(meta));
+                    ref_expr rhs = expr_fn_(e, c, expr_var::right_bp(meta));
                     return make_expr(e,
                                      expr_var::binary_op_t{
                                          .op = op,
@@ -2116,7 +1043,7 @@ namespace ast {
             } // namespace operators
         } // namespace expr_patterns
 
-        ref_expr expr_fn(env e, cursor& c, int min_prec) {
+        ref_expr expr_fn_(env e, cursor& c, int min_prec) {
             ref_expr lhs = expr_patterns::operands::parse(e, c);
 
             while (c.within() && !c.get().isa(final::TERMINATOR)) {
@@ -2138,6 +1065,12 @@ namespace ast {
             }
 
             return lhs;
+        }
+
+        ref_expr expr_fn(env e, cursor& c) {
+            auto ptr = expr_fn_(e, c, 0);
+            expect_node<final::TERMINATOR>(c.get());
+            return ptr;
         }
 
         namespace type_patterns {
@@ -2382,6 +1315,11 @@ namespace ast {
                 }(e.with(scope), c, ptr);
             }
             // could be a variable or something elsei like a function
+            auto var_infer(env e, cursor& c, ref_decl ptr) {
+                c++;
+                auto init_expr = expr_fn(e, c);
+                return decl_var::var_infer_t{.init_expr = init_expr};
+            }
             auto var(env e, cursor& c, ref_decl ptr) {
                 const auto type = type_fn(e, c);
 
@@ -2403,6 +1341,7 @@ namespace ast {
             return path_switch<ref_decl>{c}
                 .path<final::TYPE>(make_decl<decl_patterns::type_alias>, e, c, name)
                 .path<final::FN>(make_decl<decl_patterns::fn>, e, c, name)
+                .path<final::ASIGN>(make_decl<decl_patterns::var_infer>, e, c, name)
                 .def(make_decl<decl_patterns::var>, e, c, name);
         }
 
@@ -2476,17 +1415,22 @@ namespace ast {
     // hard coding the operators is diaboloical
     // this thing will be a nihtmare to update
 
-    ref_type type_of_decl(const decl_var::fn_t& v) {
-        return v.type;
-    }
     template <typename T>
         requires(is_in_list<std::remove_cvref_t<T>, decl_var::addressable>::value)
     ref_type type_of_decl(const T& v) {
         return v.type;
     }
+
+    template <typename T>
+        requires(is_in_list<std::remove_cvref_t<T>, decl_var::callable>::value)
+    ref_type type_of_decl(const T& v) {
+        return v.type;
+    }
+
     std::optional<ref_type> type_of_decl(const auto& v) {
         return std::nullopt;
     }
+
     std::optional<ref_type> type_of_decl(const ref_decl ptr) {
         const auto& val = ptr.deref();
         return std::visit(
@@ -2558,6 +1502,37 @@ namespace ast {
                     return decl_type.value();
                 },
                 [&](const expr_var::as_t& v) -> ref_type { return v.type; },
+                [&](const expr_var::block_t& v) -> ref_type {
+                    const auto scope = v.frame.scope;
+                    const auto& stmts = v.frame.stmts.deref();
+
+                    if (stmts.span.empty()) {
+                        auto ptr = allocator.alloc_one<type_t>();
+                        ptr->data = type_var::void_t{};
+                        return ptr;
+                    }
+
+                    const auto& last_stmt = stmts.span.back().deref();
+                    return std::visit(
+                        overload{[&](const stmt_var::break_t& v) -> ref_type {
+                                     if (const auto& opt = v.val; opt.has_value()) {
+                                         return opt->deref().type;
+                                     } else {
+                                         auto ptr = allocator.alloc_one<type_t>();
+                                         ptr->data = type_var::void_t{};
+                                         return ptr;
+                                     }
+                                 },
+                                 [&](const stmt_var::expr_wrap& v) -> ref_type {
+                                     return v.ref.deref().type;
+                                 },
+                                 [&](const auto& v) -> ref_type {
+                                     auto ptr = allocator.alloc_one<type_t>();
+                                     ptr->data = type_var::void_t{};
+                                     return ptr;
+                                 }},
+                        last_stmt.data);
+                },
                 [](auto& v) -> ref_type { return nullptr; },
             },
             var);
@@ -2592,13 +1567,13 @@ namespace ast {
     inline constexpr bool is_optional_of_ref_v = is_optional_of_ref<T>::value;
 
     namespace walker {
-        enum Signal {
-            Continue,
-            Skip,
+        enum signal {
+            cont,
+            skip,
         };
 
         template <typename Derived>
-        struct t {
+        struct type {
             std::flat_set<void*> visited;
 
             constexpr Derived* derived() {
@@ -2632,12 +1607,12 @@ namespace ast {
                 }
 
                 auto result = derived()->ptr_entry(ptr);
-                if (result == Continue) {
+                if (result == cont) {
                     if constexpr (requires { ptr.deref().data; }) {
 
                         std::visit(overload{[&](auto& v) {
                                        auto result = derived()->entry(ptr, v);
-                                       if (result == Continue) {
+                                       if (result == cont) {
                                            for_each_member(ptr, v);
                                        }
                                        derived()->exit(ptr, v);
@@ -2655,16 +1630,16 @@ namespace ast {
         };
     } // namespace walker
 
-    struct Resolver : walker::t<Resolver> {
+    struct Resolver : walker::type<Resolver> {
         allocator_t& allocator;
 
-        walker::Signal ptr_entry(auto ptr) {
-            return walker::Continue;
+        walker::signal ptr_entry(auto ptr) {
+            return walker::cont;
         }
         void ptr_exit(auto ptr) {}
 
-        walker::Signal entry(auto ptr, auto& v) {
-            return walker::Continue;
+        walker::signal entry(auto ptr, auto& v) {
+            return walker::cont;
         }
         void exit(auto ptr, auto& v) {}
 
@@ -2686,11 +1661,9 @@ namespace ast {
         }
 
         void insert_scope(ref_scope scope) {
-            // std::println("scope::{} with parent::{}",
-            //              scope.as_void(),
-            //              scope.deref().parent.as_void());
             scopes.push_back(scope);
         }
+
         void pop_scope() {
             scopes.pop_back();
         }
@@ -2698,22 +1671,22 @@ namespace ast {
             return scopes.back();
         }
 
-        walker::Signal entry(ref_expr ptr, expr_var::access_t& v) {
+        walker::signal entry(ref_expr ptr, expr_var::access_t& v) {
             visit(v.lhs);
-            auto scope = scope_of_type(v.lhs.deref().type);
+            auto scope = scope_of(v.lhs.deref().type);
             if (!scope) {
                 throw_error("Expected symbol to have a scope");
             }
-            this->insert_scope(scope);
+            this->insert_scope(scope.value());
             visit(v.rhs);
-            return walker::Skip;
+            return walker::skip;
         }
 
         void exit(ref_expr ptr, expr_var::access_t& v) {
             pop_scope();
         }
 
-        walker::Signal entry(ref_expr ptr, expr_var::unresolved_t& v) {
+        walker::signal entry(ref_expr ptr, expr_var::unresolved_t& v) {
             insert(ptr.as_void());
 
             auto scope = this->back_scope();
@@ -2756,7 +1729,7 @@ namespace ast {
             }
 
             remove(ptr.as_void());
-            return walker::Continue;
+            return walker::cont;
 
         } // namespace ast
 
@@ -2795,14 +1768,17 @@ namespace ast {
                 if (c.cursor == end.cursor) [[unlikely]]
                     throw_error("Trailing '::' in type chain");
 
-                auto next_scope = scope_of_decl(result);
-                return resolve_type_chain<true>(c, end, next_scope);
+                auto next_scope = scope_of(result);
+                if (!next_scope) [[unlikely]]
+                    throw_error("Expected symbol to have scope");
+
+                return resolve_type_chain<true>(c, end, next_scope.value());
             }
 
             return result;
         }
 
-        walker::Signal entry(ref_type ptr, type_var::unresolved_t& v) {
+        walker::signal entry(ref_type ptr, type_var::unresolved_t& v) {
             insert(ptr.as_void());
 
             auto c = v.data.begin;
@@ -2827,30 +1803,41 @@ namespace ast {
             }
 
             remove(ptr.as_void());
-            return walker::Continue;
+            return walker::cont;
         }
 
-        walker::Signal entry(ref_decl ptr, decl_var::fn_t& v) {
+        walker::signal entry(ref_decl ptr, decl_var::fn_t& v) {
             insert_scope(v.scope);
-            return walker::Continue;
+            return walker::cont;
         }
         void exit(ref_decl ptr, decl_var::fn_t& v) {
             pop_scope();
         }
-        walker::Signal entry(ref_expr ptr, expr_var::block_t& v) {
+
+        walker::signal entry(ref_expr ptr, expr_var::block_t& v) {
             insert_scope(v.frame.scope);
-            return walker::Continue;
+            return walker::cont;
         }
+
         void exit(ref_expr ptr, expr_var::block_t& v) {
             pop_scope();
         }
-        walker::Signal entry(ref_type ptr, type_var::rec_t& v) {
+
+        walker::signal entry(ref_type ptr, type_var::rec_t& v) {
             insert_scope(v.scope);
 
-            return walker::Continue;
+            return walker::cont;
         }
+
         void exit(ref_type ptr, type_var::rec_t& v) {
             pop_scope();
+        }
+
+        void exit(ref_decl ptr, decl_var::var_infer_t& v) {
+            ptr.deref().data = decl_var::var_t{
+                .type = v.init_expr.deref().type,
+                .init_expr = v.init_expr,
+            };
         }
 
         void ptr_exit(ref_expr ptr) {
@@ -3126,6 +2113,14 @@ namespace ast {
 
             // --- decl variants ---
 
+            void print_decl(const decl_t& d, const decl_var::var_infer_t& v) {
+                // print(v.type);
+                os << ' ' << resolve(d.name);
+                if (v.init_expr) {
+                    os << " = ";
+                    print(v.init_expr);
+                }
+            }
             void print_decl(const decl_t& d, const decl_var::var_t& v) {
                 print(v.type);
                 os << ' ' << resolve(d.name);
@@ -3184,18 +2179,18 @@ namespace ast {
         template <typename NameResolver>
         printer(std::ostream&, NameResolver) -> printer<NameResolver>;
 
-        struct ExprTreePrinter : walker::t<ExprTreePrinter> {
+        struct ExprTreePrinter : walker::type<ExprTreePrinter> {
             std::ostream& os;
             std::vector<bool> last_child_stack;
 
             explicit ExprTreePrinter(std::ostream& os) : os(os) {}
 
-            walker::Signal ptr_entry(auto ptr) {
-                return walker::Continue;
+            walker::signal ptr_entry(auto ptr) {
+                return walker::cont;
             }
             void ptr_exit(auto ptr) {}
-            walker::Signal entry(auto ptr, auto& v) {
-                return walker::Continue;
+            walker::signal entry(auto ptr, auto& v) {
+                return walker::cont;
             }
             void exit(auto ptr, auto& v) {}
 
@@ -3284,66 +2279,66 @@ namespace ast {
             }
 
           public:
-            walker::Signal entry(ref_expr ptr, expr_var::int_literal_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::int_literal_t& v) {
                 node(ptr, std::format("IntLit({})", v.value));
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::float_literal_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::float_literal_t& v) {
                 node(ptr, std::format("FloatLit({})", v.value));
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::bool_literal_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::bool_literal_t& v) {
                 node(ptr, std::format("BoolLit({})", v.value ? "true" : "false"));
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::unresolved_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::unresolved_t& v) {
                 node(ptr, "Unresolved");
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::name_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::name_t& v) {
                 node(
                     ptr,
                     std::format("Name({})",
                                 v.decl ? std::to_string(v.decl.deref().name) : "<null>"));
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::binary_op_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::binary_op_t& v) {
                 node(ptr, std::format("BinOp({})", op_str(v.op)));
                 visit_child(v.lhs, false);
                 visit_child(v.rhs, true);
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::unary_op_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::unary_op_t& v) {
                 node(ptr, std::format("UnaryOp({})", op_str(v.op)));
                 visit_child(v.operand, true);
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::call_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::call_t& v) {
                 node(ptr, "Call");
                 visit_child(v.callee, v.args.empty());
                 visit_children(v.args);
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::access_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::access_t& v) {
                 node(ptr, "Access");
                 visit_child(v.lhs, false);
                 visit_child(v.rhs, true);
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::rec_init_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::rec_init_t& v) {
                 node(ptr, "RecInit");
                 visit_children(v.args);
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::as_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::as_t& v) {
                 node(ptr, "As");
                 visit_child(v.expr, true);
-                return walker::Skip;
+                return walker::skip;
             }
-            walker::Signal entry(ref_expr ptr, expr_var::block_t& v) {
+            walker::signal entry(ref_expr ptr, expr_var::block_t& v) {
                 node(ptr, "Block");
                 visit(v.frame.stmts);
-                return walker::Skip;
+                return walker::skip;
             }
         };
     } // namespace SLOP

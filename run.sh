@@ -1,1 +1,1 @@
-./trt.out ./examples/file.trt
+./build/release/trt ./examples/file.trt

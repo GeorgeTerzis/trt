@@ -6,6 +6,44 @@ A simple compiled language built from scratch in C++23. The goal is to start sma
 
 ---
 
+## Building
+
+### Requirements
+- Clang++
+- CMake ≥ `3.20`
+- LLVM
+- C++23
+
+### Debug:
+
+```bash
+  ./setup_debug.sh
+  ./compile_debug.sh
+```
+
+### Release:
+
+```bash
+  ./setup_release.sh
+  ./compile_release.sh
+```
+Executables will be at `build/debug/trt` and `build/release/trt`
+
+LLVM is currently used for utilities and will later become the backend.
+
+**Tested on Linux with Clang only.** The lexer uses `[[clang::musttail]]` for its dispatch loop, whether other compilers support this attribute is unknown, so for now Clang is the safe choice.
+
+---
+
+## Usage
+Examples are provided at `./examples/`.
+
+``` bash
+# You can pass whaterver you want really.
+trt file.trt
+```
+---
+
 ## Project files
 ```
 libs/             — allocator, ref, map, vector, and other utilities
@@ -93,35 +131,10 @@ rec(field: type; ...) — anonymous record / struct
 
 ---
 
-## Building
-
-Either use the provided script:
-```bash
-./compile.sh
-```
-
-Or compile manually:
-```bash
-clang++ ./src/main.cpp -std=c++23 $(llvm-config --libs) -o trt.out
-./trt.out <file.trt>
-```
-
-**Tested on Linux with Clang only.** The lexer uses `[[clang::musttail]]` for its dispatch loop, whether other compilers support this attribute is unknown, so for now Clang is the safe choice.
-
-Dependencies:
-- clang++ with C++23 support
-- LLVM (for the allocator and string utilities and the backend in the future)
----
-
-## Usage
-you can pass whaterver you want really
-``` bash
-trt.out file.trt
-```
 
 ## Notes
 
-**Integer types** are fixed-width. The user can define any bit width up to what fits in a `uint32`, so `u7`, `u24`, `s3` etc. are all valid.
+**Integer types** are fixed-width. The user can define any bit width up to what fits in a `uint32`, so `u7`, `u24`, `s3` etc. are all valid but should keep it under what LLVM IR has the limit to.
 
 **`usize` and `isize`** are currently hardcoded to 64-bit. The plan is to derive them from the target system at compile time.
 
