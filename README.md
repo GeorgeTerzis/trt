@@ -17,16 +17,17 @@ A simple compiled language built from scratch in C++23. The goal is to start sma
 ### Debug:
 
 ```bash
-  ./setup_debug.sh
-  ./compile_debug.sh
+  ./setup.sh debug
+  ./compile.sh debug
 ```
 
 ### Release:
 
 ```bash
-  ./setup_release.sh
-  ./compile_release.sh
-```
+  ./setup.sh release
+  ./compile.sh release
+````
+
 Executables will be at `build/debug/trt` and `build/release/trt`
 
 LLVM is currently used for utilities and will later become the backend.
