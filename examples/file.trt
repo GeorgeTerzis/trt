@@ -1,31 +1,59 @@
-// a simple dynamic array arena
+// Tag: @type @enum(
+//     Allocated;
+//     Free;
+// );
+// Node: @type @var(Tag)(
+//     Allocated: @rec(
+//         mem0: s32;
+//         mem1: u32;
+//     );
+//     Free: @rec(
+//         mem1: s32;
+//     );
+// );
+
+allocator: @type @rec(
+    ctx: opaque;
+
+    alloc: opaque;
+    aligned_alloc: opaque;
+    free: opaque;
+    realloc: opaque;
+);
+cmalloc: @fn(size: usize) opaque = @external "malloc";
+caligned_alloc: @fn(alignment: usize; size: usize) opaque = @external "aligned_alloc";
+cfree: @fn(ptr: opaque) void = @external "free";
+
 arena: @type @rec(
     capacity: usize;
     length: usize;
     data: opaque;
 );
-
-
-cmalloc: @fn(alignment: usize; size: usize) opaque = 0;
-
 arena_init: @fn(capacity: s32) arena = (
- length: s32 = 0;
- data: opaque = cmalloc(capacity);
- ret @(arena)(capacity; length; data);
+    length: s32 = 0;
+    data: opaque = caligned_alloc(capacity);
+    @(arena)(capacity; length; data);
 );
+arena_deinit: @fn(self: imut * arena) void =
+    cfree(self::data);
 
-// arena_new: @fn(capacity: usize) arena = arena_init(capacity);
-// arena_alloc: @fn(a: *arena; size: usize; align: usize) opaque = arena_alloc_impl(a; size; align);
-arena_len: @fn(a: *arena) usize = a::length;
-arena_is_full: @fn(a: *arena) usize = a::length and a::capacity;
+// arena_alloc: @fn(self: imut * arena; size: usize; align: usize) opaque = (
+//     case (self::length+ size < self::capacity) (
+//         true => (
+//         );
+//     )
+// );
 
-b: B = 0;
-c: D = b::mem1::mem0;
+arena_len: @fn(a: imut*imut arena) usize = a::length;
+arena_is_full: @fn(a: imut*imut arena) usize = a::length and a::capacity;
 
 B: @type @rec(
     mem0: s32;
     mem1: C;
 );
+
+b: B = @(B)(0; @(C)(0));
+c: D = b::mem1::mem0;
 
 A: @type @rec(
   mem0: C;
@@ -33,16 +61,14 @@ A: @type @rec(
 );
 
 C: @type @rec(mem0: f32);
-
 D: @type C;
 
 // (
-// d: @var(pos0: s32; pos1: f32) = noval;
+// d: @var(tag0: s32; tag1: f32) = noval;
 // result := @match(d) u32 (
 //     tag0: capture => expr;
 //     &tag1: capture => expr;
 //     tag2 => expr;
 // );
 // )
-
 

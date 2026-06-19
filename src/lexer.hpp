@@ -1,14 +1,15 @@
 #pragma once
-#include "../include/utf8/checked.h"
 
+#include "../include/utf8/checked.h"
 #include "../libs/become.hpp"
-#include "throw_error.hpp"
+#include "diagnostic.cpp"
 #include <cstdint>
 #include <format>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/ADT/StringSwitch.h>
+#include <llvm/Support/SourceMgr.h>
 #include <optional>
 #include <print>
 #include <span>
@@ -16,45 +17,7 @@
 #include <string_view>
 #include <utility>
 
-struct source {
-    std::string filename;
-    std::string text;
-
-    source(auto f, auto s) : filename(f), text(s) {}
-
-    source(const source&) = delete;
-    source& operator=(const source&) = delete;
-
-    source(source&&) noexcept = default;
-    source& operator=(source&&) noexcept = default;
-
-    operator std::string_view() const noexcept {
-        return text;
-    }
-    const char* data() const noexcept {
-        return text.data();
-    }
-    size_t size() const noexcept {
-        return text.size();
-    }
-    bool empty() const noexcept {
-        return text.empty();
-    }
-    char operator[](size_t i) const {
-        return text[i];
-    }
-    auto substr(size_t pos = 0, size_t count = std::string_view::npos) const {
-        size_t len = std::min(count, text.size() - pos);
-        return std::string_view(text.data() + pos, len);
-    }
-    auto begin() const noexcept {
-        return text.begin();
-    }
-    auto end() const noexcept {
-        return text.end();
-    }
-};
-using source_view = source&;
+#include "source.hpp"
 
 struct node;
 struct median;
@@ -315,33 +278,6 @@ struct cursor_base_t {
 // using cursor_t = cursor_base_t<node>;
 using const_cursor_t = cursor_base_t<const node>;
 
-struct source_location {
-    std::uint32_t line;
-    std::uint32_t col;
-    std::uint32_t begin;
-    std::uint32_t end;
-
-    source_location(std::uint32_t line,
-                    std::uint32_t col,
-                    std::uint32_t begin,
-                    std::uint32_t end) :
-        line(line),
-        col(col),
-        begin(begin),
-        end(end) {}
-
-    auto length() const {
-        return end - begin;
-    }
-
-    std::string_view source(const std::string_view src) const {
-        if (begin <= end)
-            return std::string_view(src.begin() + begin, src.begin() + end);
-        else
-            return "";
-    }
-};
-
 namespace lexer {
     using intern_id = std::uint32_t;
     struct intern_table {
@@ -400,14 +336,11 @@ namespace lexer {
         std::string_view str(intern_id id) const {
             return itable.lookup(id);
         }
-        std::string_view str(source_location loc) const {
-            return loc.source(src.text);
-        }
-        std::string_view str(const node* node) const {
-            auto index = to_index(node);
-            auto location = loc(index);
-            return str(location);
-        }
+        // std::string_view str(const node* node) const {
+        //     auto index = to_index(node);
+        //     auto location = loc(index);
+        //     return str(location);
+        // }
     };
 
     struct buffer_builder {
@@ -424,8 +357,12 @@ namespace lexer {
             std::uint32_t index;
         };
 
-        buffer_builder buffer;
+        llvm::SourceMgr& source_manager;
+        const std::uint32_t src_id;
 
+        diagnostics::unit& diagnostic_unit;
+
+        buffer_builder buffer;
         llvm::SmallVector<symetrical_entry, 0> openstack = {};
 
         uint32_t line = 1;
@@ -436,20 +373,27 @@ namespace lexer {
         uint32_t last_terminator_depth = 0;
         uint32_t prev_depth = 0; // tracks per open and close
 
-        source_location make_srcloc(std::uint32_t begin, std::uint32_t end) const {
-            const auto col = begin - this->line_index;
-            const auto v = source_location{this->line, col, begin, end};
-            return v;
+        auto base() const {
+            return this->source_manager.getMemoryBuffer(this->src_id)->getBufferStart();
+        }
+
+        source_location make_srcloc(uint32_t begin, uint32_t end) const {
+
+            return {llvm::SMLoc::getFromPointer(this->base() + begin),
+                    llvm::SMLoc::getFromPointer(this->base() + end)};
         }
     };
-    buffer entry(source& src, intern_table& itable);
+    buffer entry(source& src,
+                 llvm::SourceMgr& sm,
+                 std::uint32_t src_id,
+                 diagnostics::unit& dunit,
+                 intern_table& itable);
     std::string_view str(final::e e);
     std::string_view str(median::e e);
     std::string str(const source_location val);
     std::string str(const final val);
     std::string str(const median val);
     std::string str(const node& val);
-    std::string str(const node& n, const lexer::buffer& buffer);
+    // std::string str(const node& n, const lexer::buffer& buffer);
     void pretty_print(const buffer& buf, source_view src);
-
 } // namespace lexer

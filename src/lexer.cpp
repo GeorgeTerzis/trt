@@ -1,6 +1,12 @@
 #include "lexer.hpp"
+#include <llvm/Support/SMLoc.h>
+#include <llvm/Support/SourceMgr.h>
+#include <utility>
 
 namespace lexer {
+    std::string str(const source_location val) {
+        return std::string(val.source());
+    }
 
 #define RET void
 #define ARGS unit &u, source_view src, const uint32_t token_begin, uint32_t cursor
@@ -9,7 +15,7 @@ namespace lexer {
     using dispatch_table = std::array<RET (*)(ARGS), 256>;
     using truth_table = std::array<bool, 256>;
 
-    auto within_src(std::string_view src, std::uint32_t index) {
+    inline auto within_src(const std::string_view src, const std::uint32_t index) {
         return src.size() > index;
     }
 
@@ -54,12 +60,12 @@ namespace lexer {
         }
     }
 
-    std::string str(const source_location val) {
-        return std::format("loc={{line={}, len={}, index={}}}",
-                           val.line,
-                           val.length(),
-                           val.begin);
-    }
+    // std::string str(const source_location val) {
+    //     return std::format("loc={{line={}, len={}, index={}}}",
+    //                        val.line,
+    //                        val.length(),
+    //                        val.begin);
+    // }
     std::string str(const final val) {
         return std::format("final={{code={}}}", str(val.code));
     }
@@ -107,7 +113,7 @@ namespace lexer {
 
     std::uint32_t open_median(unit& u,
                               median::e code,
-                              std::string_view src,
+                              source_view src,
                               std::uint32_t token_begin,
                               std::uint32_t cursor);
 
@@ -132,9 +138,32 @@ namespace lexer {
         become next(u, src, end, end);
     }
 
+    node get_error() {
+        return node{final::error};
+    }
+
+    template <typename... Args>
+    [[clang::always_inline, nodiscard("Recovery point should be used")]] auto
+    error_handling(unit& u,
+                   source_view src,
+                   const uint32_t token_begin,
+                   uint32_t cursor,
+                   std::format_string<Args...> fmt,
+                   Args&&... args) -> std::uint32_t {
+        const auto err_loc = u.make_srcloc(token_begin, cursor);
+        u.buffer.push(get_error(), err_loc);
+        make_terminator(u, src, token_begin, cursor);
+
+        u.diagnostic_unit.emit(diagnostics::severity::DK_Error,
+                               err_loc,
+                               std::format(fmt, std::forward<Args>(args)...));
+
+        return cursor;
+    }
+
     std::uint32_t open_median(unit& u,
                               median::e code,
-                              std::string_view src,
+                              source_view src,
                               std::uint32_t token_begin,
                               std::uint32_t cursor) {
 
@@ -156,10 +185,12 @@ namespace lexer {
         }
 
         {
-            auto& open_source_location = u.buffer.out.loc(index);
-            open_source_location.end = cursor;
+            auto& loc = u.buffer.out.loc(index);
+            loc.end = llvm::SMLoc::getFromPointer(u.base() + cursor);
         }
+
         u.prev_depth = u.depth;
+
         --u.depth;
     }
 
@@ -191,12 +222,26 @@ namespace lexer {
             auto c = src[cursor];
             cursor += 1;
 
+            if (u.openstack.empty()) {
+                const auto recovery = error_handling(u,
+                                                     src,
+                                                     token_begin,
+                                                     cursor,
+                                                     "unexpected symetrical close '{}'",
+                                                     src[cursor]);
+                become next(u, src, recovery, recovery);
+            }
             auto open_index = u.openstack.back();
+            if (!symetrical_close_match(open_index.code, c)) [[unlikely]] {
+                const auto recovery = error_handling(u,
+                                                     src,
+                                                     token_begin,
+                                                     cursor,
+                                                     "unexpected symbol '{}'",
+                                                     src[cursor]);
+                become next(u, src, recovery, recovery);
+            }
             u.openstack.pop_back();
-
-            if (!symetrical_close_match(open_index.code, c)) [[unlikely]]
-                std::abort();
-
             auto prev_non_whitespace = [&]() -> unsigned char {
                 auto i = cursor - 2;
                 while (i > 0 && (whitesapce::is_horizontal(src[i]) ||
@@ -207,7 +252,7 @@ namespace lexer {
 
             if (prev_non_whitespace() != ';') {
                 auto loc = u.buffer.out.locs.back();
-                loc.end = 0;
+                loc.end = llvm::SMLoc::getFromPointer(u.base() + cursor);
                 u.buffer.push(get_terminator(), loc);
                 u.last_terminator_depth = u.depth;
             }
@@ -365,8 +410,9 @@ namespace lexer {
         become next(u, src, i, i);
     }
 
-    [[noreturn]] auto unreachable_state FNSIG {
-        std::unreachable();
+    auto unreachable_state FNSIG {
+        auto recovery = error_handling(u, src, token_begin, cursor, "Unreachable state");
+        become next(u, src, recovery, recovery);
     }
 
     constexpr auto symbol_sequence_table = [] consteval {
@@ -424,8 +470,9 @@ namespace lexer {
         cursor += text.size();
 
         // empty text something has failed
-        if (text.size() == 0) [[unlikely]]
-            std::abort();
+        if (text.size() == 0) [[unlikely]] {
+            std::unreachable();
+        }
 
         auto subbegin = text.begin();
         auto len = text.size();
@@ -440,8 +487,9 @@ namespace lexer {
             if (r == final::e::last) [[unlikely]] {
                 len--;
                 cursor--;
-                if (len == 0) [[unlikely]]
-                    std::abort();
+                if (len == 0) [[unlikely]] {
+                    std::unreachable();
+                }
             } else {
                 const auto src_loc = u.make_srcloc(token_begin, cursor);
                 u.buffer.push(node(final(r)), src_loc);
@@ -461,10 +509,17 @@ namespace lexer {
 #include "./def"
                         .Default(final::e::last);
 
-        if (code == final::e::last) [[unlikely]]
-            throw_error(std::format("Unknown builtin '@{}'", std::string_view(word)));
-
         const auto src_loc = u.make_srcloc(token_begin, static_cast<uint32_t>(end));
+        if (code == final::e::last) [[unlikely]] {
+            auto recovery = error_handling(u,
+                                           src,
+                                           token_begin,
+                                           cursor,
+                                           "unknown builtin '@{}'",
+                                           word);
+            become next(u, src, recovery, recovery);
+        }
+
         u.buffer.push(node(final(code)), src_loc);
 
         become next(u, src, end, end);
@@ -546,7 +601,7 @@ namespace lexer {
     std::string format_node_text(const buffer& b, const node& n) {
         const auto buffer_index = b.to_index(&n);
         const auto loc = b.loc(buffer_index);
-        const auto text = loc.source(b.src);
+        const auto text = loc.source();
 
         const auto fin_text =
             (n.as_final() && text.size()) ? "'" + std::string(text) + "'" : "";
@@ -585,7 +640,11 @@ namespace lexer {
         return;
     }
 
-    buffer entry(source& src, intern_table& itable) {
+    buffer entry(source& src,
+                 llvm::SourceMgr& sm,
+                 std::uint32_t src_id,
+                 diagnostics::unit& dunit,
+                 intern_table& itable) {
         buffer buffer{
             .itable = itable,
             .src = src,
@@ -593,13 +652,23 @@ namespace lexer {
             .locs = {},
         };
         buffer_builder builder{buffer};
-        unit u{builder};
+        unit u{sm, src_id, dunit, builder};
 
         open_median(u, median::e::FILE, src, 0, 0);
         next(u, src, 0, 0);
         close_median(0, u, src, src.size());
 
-        assert(!u.openstack.size());
+        if (u.openstack.size()) {
+            for (const auto& elm : u.openstack) {
+                const auto loc = buffer.loc(elm.index);
+                (void)lexer::error_handling(u,
+                                            src,
+                                            0,
+                                            0,
+                                            "Did not close symetrical `{}`",
+                                            *loc.begin.getPointer());
+            }
+        } // assert(!u.openstack.size());
 
         return buffer;
     }

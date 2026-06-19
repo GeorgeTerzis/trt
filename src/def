@@ -18,6 +18,8 @@
 #define KEYWORD(spelling, code) TOKEN_BASE(code)
 #endif
 
+TOKEN_BASE(error)
+
 VIRTUAL(ID)
 VIRTUAL(UINT_TYPE)
 VIRTUAL(SINT_TYPE)

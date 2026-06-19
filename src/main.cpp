@@ -21,6 +21,7 @@
 #include "lexer.hpp"
 #include "throw_error.hpp"
 #include <boost/pfr/core.hpp>
+#include <boost/type_index.hpp>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,8 @@
 #include <llvm/MC/MCInst.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/Alignment.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/TypeSize.h>
 #include <llvm/Support/raw_ostream.h>
@@ -67,6 +70,11 @@
 #include <variant>
 #include <vector>
 #include <wchar.h>
+
+template <typename T>
+auto type_name() {
+    return boost::typeindex::type_id<T>().pretty_name();
+}
 
 namespace ast {
     // One of the biggest problems (not so much of a problem but there is a fix to it)
@@ -134,6 +142,7 @@ namespace ast {
             [[clang::musttail]] return get_root(current.deref().parent);
         }
     };
+
     void print_scope(const ref_scope& scope, int depth = 0) {
         if (!scope) {
             std::println("scope: null");
@@ -294,10 +303,6 @@ namespace ast {
             std::span<ref_expr> args;
         };
 
-        // struct call_payload_t {
-        //     std::span<ref_expr> args;
-        // };
-
         struct match_t {
             struct arm_t {
                 ref_expr value;
@@ -312,11 +317,13 @@ namespace ast {
             ref_expr callee;
             std::span<ref_expr> args;
         };
+
         // used to coerse expresions to types
         struct as_t {
             ref_type type;
             ref_expr expr;
         };
+
         struct bitcast_t {
             ref_type type;
             ref_expr expr;
@@ -874,7 +881,7 @@ namespace ast {
             namespace operands {
                 expr_var::variant int_lit(env e, cursor& c) {
                     const auto index = e.buffer.to_index(&c.get());
-                    const auto text = e.buffer.str(e.buffer.loc(index));
+                    const auto text = e.buffer.loc(index).source();
                     std::uint64_t val;
                     std::from_chars(text.data(), text.data() + text.size(), val);
                     c++;
@@ -883,7 +890,7 @@ namespace ast {
 
                 expr_var::variant float_lit(env e, cursor& c) {
                     const auto index = e.buffer.to_index(&c.get());
-                    const auto text = e.buffer.str(e.buffer.loc(index));
+                    const auto text = e.buffer.loc(index).source();
                     double val;
                     std::from_chars(text.data(), text.data() + text.size(), val);
                     c++;
@@ -1298,7 +1305,8 @@ namespace ast {
                             .scope = e.scope,
                             .args = args,
                             .ret_type = ret_type,
-                            .external_symbol_name = e.buffer.str(&sym_node),
+                            .external_symbol_name =
+                                e.buffer.loc(e.buffer.to_index(&sym_node)).source(),
                         }};
                     }
 
@@ -2220,37 +2228,18 @@ namespace ast {
                 if (!t)
                     return "<no type>";
                 return std::visit(
-                    overload{
-                        [](const type_var::integer_literal_t&) -> std::string {
-                            return "int_literal";
-                        },
-                        [](const type_var::float_literal_t&) -> std::string {
-                            return "float_literal";
-                        },
-                        [](const type_var::uint_t& v) -> std::string {
-                            return std::format("u{}", v.bit_size);
-                        },
-                        [](const type_var::sint_t& v) -> std::string {
-                            return std::format("i{}", v.bit_size);
-                        },
-                        [](const type_var::f16_t&) -> std::string { return "f16"; },
-                        [](const type_var::f32_t&) -> std::string { return "f32"; },
-                        [](const type_var::f64_t&) -> std::string { return "f64"; },
-                        [](const type_var::f128_t&) -> std::string { return "f128"; },
-                        [](const type_var::void_t&) -> std::string { return "void"; },
-                        [](const type_var::optr_t&) -> std::string { return "optr"; },
-                        [](const type_var::ptr_t&) -> std::string { return "ptr"; },
-                        [](const type_var::rec_t&) -> std::string { return "rec"; },
-                        [](const type_var::callable_t&) -> std::string {
-                            return "callable";
-                        },
-                        [](const type_var::type_alias_t& v) -> std::string {
-                            return type_label(v.type);
-                        },
-                        [](const type_var::unresolved_t&) -> std::string {
-                            return "<unresolved>";
-                        },
-                    },
+                    overload{[](const type_var::uint_t& v) -> std::string {
+                                 return std::format("u{}", v.bit_size);
+                             },
+                             [](const type_var::sint_t& v) -> std::string {
+                                 return std::format("i{}", v.bit_size);
+                             },
+                             [](const type_var::type_alias_t& v) -> std::string {
+                                 return type_label(v.type);
+                             },
+                             []<typename T>(const T& v) -> std::string {
+                                 return std::string(type_name<T>());
+                             }},
                     t.deref().data);
             }
 
@@ -2610,21 +2599,26 @@ int main(int argc, char* argv[]) {
     }
 
     std::string_view filepath = argv[1];
+
+    diagnostics::unit diagnostic_unit;
     lexer::intern_table intern_table;
 
     auto llvm_unit = codegen::unit(filepath);
-    const auto pointer_size = llvm_unit.data_layout().getPointerSize();
 
-    auto text = load_file(filepath);
-    if (!text) [[unlikely]] {
-        throw std::runtime_error(text.error());
-    }
-
+    llvm::SourceMgr sm;
+    auto main_file = llvm::MemoryBuffer::getFile(filepath);
     std::println("file=\"{}\"", filepath);
+    auto src_id = sm.AddNewSourceBuffer(std::move(*main_file), llvm::SMLoc());
 
-    source src{std::string(filepath), std::move(text.value())};
-    const auto lexer_output = lexer::entry(src, intern_table);
+    source src{filepath, sm.getBufferInfo(src_id).Buffer.get()->getBuffer()};
+    const auto lexer_output =
+        lexer::entry(src, sm, src_id, diagnostic_unit, intern_table);
     lexer::pretty_print(lexer_output, src);
+
+    if (!diagnostic_unit.diagnostics.empty()) {
+        diagnostics::print_all(llvm::errs(), diagnostic_unit, sm);
+        std::exit(EXIT_FAILURE);
+    }
 
     llvm_allocator arena;
     auto file = ast::entry(arena, lexer_output, llvm_unit.data_layout());
