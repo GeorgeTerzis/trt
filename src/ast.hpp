@@ -919,22 +919,22 @@ namespace ast {
                     auto& m = node.as_median().value().get();
                     expect<median::PARENS>(m.code);
 
-                    auto stmts_cursor = cursor(m.children());
+                    auto stmts_cursor = cursor{m.children()};
                     const auto stmts = stmts_fn(e.with(scope), stmts_cursor);
                     return expr_var::block_t{util::frame(scope, stmts)};
                 }
 
                 expr_var::variant block(env e, cursor& c) {
                     const auto& node = c++.get();
+                    return block_fn(e, node);
+                    // ref scope = make_scope(e);
+                    // auto& m = node.as_median().value().get();
+                    // expect<median::PARENS>(m.code);
 
-                    ref scope = make_scope(e);
-                    auto m = node.as_median().value().get();
-                    expect<median::PARENS>(m.code);
-
-                    auto stmts_cursor = cursor(m.children());
-                    std::println("Value");
-                    const auto stmts = stmts_fn(e.with(scope), stmts_cursor);
-                    return expr_var::block_t{util::frame(scope, stmts)};
+                    // auto stmts_cursor = cursor(m.children());
+                    // std::println("Value");
+                    // const auto stmts = stmts_fn(e.with(scope), stmts_cursor);
+                    // return expr_var::block_t{util::frame(scope, stmts)};
                 }
 
                 ref_expr parse(env e, cursor& c);
