@@ -228,7 +228,7 @@ namespace lexer {
                                                      token_begin,
                                                      cursor,
                                                      "unexpected symetrical close '{}'",
-                                                     src[cursor]);
+                                                     src[cursor - 1]);
                 become next(u, src, recovery, recovery);
             }
             auto open_index = u.openstack.back();

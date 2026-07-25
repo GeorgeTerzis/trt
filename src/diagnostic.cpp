@@ -27,9 +27,6 @@ namespace diagnostics {
         std::vector<type> diagnostics;
 
         template <typename StrT>
-            requires(std::is_same_v<StrT, std::string> ||
-                     std::is_same_v<StrT, std::string_view> ||
-                     std::is_same_v<StrT, llvm::StringRef>)
         void emit(llvm::SourceMgr::DiagKind s, source_location l, StrT&& msg) {
             this->diagnostics.push_back(type{
                 .severity = s,

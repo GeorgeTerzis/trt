@@ -54,4 +54,5 @@ struct source {
         return text.end();
     }
 };
+
 using source_view = source&;

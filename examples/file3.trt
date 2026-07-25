@@ -1,0 +1,52 @@
+cmalloc: @fn(size: usize) opaque = @external "malloc";
+caligned_alloc: @fn(alignment: usize; size: usize) opaque = @external "aligned_alloc";
+cfree: @fn(ptr: opaque) void = @external "free";
+crealloc: @fn(ptr: opaque; size: usize) void = @external "realloc";
+
+// c_allocator := @(imut allocator)(
+//     null;
+//     cmalloc;
+//     caligned_alloc;
+//     cfree;
+//     crealloc;
+// );
+
+roundup: @fn(num: u64; align: u64) u64 = (num + align - 1) & ~(align - 1);
+
+
+allocator_vtable: @type @rec(
+    alloc: imut opaque;
+    aligned_alloc: imut opaque;
+    free: imut opaque;
+    realloc: imut opaque;
+);
+
+allocator: @type @rec(
+    ctx: opaque;
+    vtable: imut allocator_vtable;
+);
+
+
+arena: @type @rec(
+    capacity: usize;
+    length: usize;
+    data: opaque;
+);
+
+arena_init: @fn(capacity_in_bytes: s32) arena = (
+    length: s32 = 0;
+    data: opaque = caligned_alloc(capacity_in_bytes);
+
+    @(arena)(capacity_in_bytes; length; data);
+);
+
+arena_deinit:
+    @fn(self: imut * arena) void = cfree(self::data);
+
+arena_len: @fn(a: imut* imut arena) usize =
+    a::length;
+
+main: @fn(argc: s32; argv: **u8) s32  = (
+    ret 10 + 20;
+);
+

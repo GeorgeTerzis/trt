@@ -1,0 +1,11 @@
+// ./build/$MODE/trt ./examples/malloc_test.trt
+// clang out.o -o out && ./out; echo $?
+
+malloc: @fn(size: usize) opaque = @external "malloc";
+free: @fn(ptr: opaque) void = @external "free";
+
+main: @fn(argc: s32; argv: **u8) s32 = (
+    p: opaque = malloc(64);
+    free(p);
+    0;
+);
