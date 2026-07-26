@@ -295,29 +295,28 @@ namespace ast {
 
         enum class op_e {
             opcall,
-
-            opadd, // +
-            opsub, // -
-            opmul, // *
-            opdiv, // /
-            opmod, // %
-
-            opnot, // not
-            opand, // and
-            opor,  // or
-
+            opadd,    // +
+            opsub,    // -
+            opmul,    // *
+            opdiv,    // /
+            opmod,    // %
+            opnot,    // not
+            opand,    // and
+            opor,     // or
+            opequal,  // ==
             opbitnot, // !
             opbitand, // &
             opbitor,  // |
             opbitxor, // ^
-
             count,
         };
         enum class op_pos : std::uint8_t { prefix, infix, postfix };
+
         struct op_meta_t {
             op_e op;
             op_pos pos;
             std::uint8_t prec;
+            std::string_view sym;
             bool right_assoc = false;
 
             constexpr bool is_pref() const {
@@ -337,24 +336,27 @@ namespace ast {
             }
         };
 
+        // the correct wya would beto take this and split into arrays in
+        // but this will do for now
         constexpr auto opmeta_lut = std::array{
-            op_meta_t{op_e::opcall, op_pos::postfix, 10, false},
+            op_meta_t{op_e::opcall, op_pos::postfix, 10, "<call>", false},
+            op_meta_t{op_e::opadd, op_pos::infix, 7, "+", false},
+            op_meta_t{op_e::opsub, op_pos::infix, 7, "-", false},
+            op_meta_t{op_e::opmul, op_pos::infix, 8, "*", false},
+            op_meta_t{op_e::opdiv, op_pos::infix, 8, "/", false},
+            op_meta_t{op_e::opmod, op_pos::infix, 8, "%", false},
 
-            op_meta_t{op_e::opadd, op_pos::infix, 7, false},
-            op_meta_t{op_e::opsub, op_pos::infix, 7, false},
-            op_meta_t{op_e::opmul, op_pos::infix, 8, false},
-            op_meta_t{op_e::opdiv, op_pos::infix, 8, false},
-            op_meta_t{op_e::opmod, op_pos::infix, 8, false},
+            op_meta_t{op_e::opnot, op_pos::prefix, 9, "not", false},
+            op_meta_t{op_e::opand, op_pos::infix, 3, "and", false},
+            op_meta_t{op_e::opor, op_pos::infix, 2, "or", false},
+            op_meta_t{op_e::opequal, op_pos::infix, 2, "==", false},
 
-            op_meta_t{op_e::opnot, op_pos::prefix, 9, false},
-            op_meta_t{op_e::opand, op_pos::infix, 3, false},
-            op_meta_t{op_e::opor, op_pos::infix, 2, false},
-
-            op_meta_t{op_e::opbitnot, op_pos::prefix, 9, false},
-            op_meta_t{op_e::opbitand, op_pos::infix, 6, false},
-            op_meta_t{op_e::opbitor, op_pos::infix, 4, false},
-            op_meta_t{op_e::opbitxor, op_pos::infix, 5, false},
+            op_meta_t{op_e::opbitnot, op_pos::prefix, 9, "!", false},
+            op_meta_t{op_e::opbitand, op_pos::infix, 6, "&", false},
+            op_meta_t{op_e::opbitor, op_pos::infix, 4, "|", false},
+            op_meta_t{op_e::opbitxor, op_pos::infix, 5, "^", false},
         };
+
         struct binary_op_t {
             op_e op;
             ref_expr lhs;
@@ -518,14 +520,13 @@ namespace ast {
                 return true;
             if (!a || !b)
                 return false;
-            return eq<Policy>(a.deref(), b.deref());
+            return eq(a.deref(), b.deref());
         }
 
         static bool eq(const type_t& a, const type_t& b) {
-            return std::visit(
-                [](const auto& x, const auto& y) { return eq_impl<Policy>(x, y); },
-                a.data,
-                b.data);
+            return std::visit([](const auto& x, const auto& y) { return eq_impl(x, y); },
+                              a.data,
+                              b.data);
         }
 
       private:
@@ -547,7 +548,7 @@ namespace ast {
         }
 
         static bool eq_impl(const type_var::ptr_t& a, const type_var::ptr_t& b) {
-            return eq<Policy>(a.type, b.type);
+            return eq(a.type, b.type);
         }
 
         static bool eq_impl(const type_var::rec_t& a, const type_var::rec_t& b) {
@@ -558,7 +559,7 @@ namespace ast {
                     std::get<decl_var::rec_member_t>(a.members[i].deref().data).type;
                 const auto& tb =
                     std::get<decl_var::rec_member_t>(b.members[i].deref().data).type;
-                if (!eq<Policy>(ta, tb))
+                if (!eq(ta, tb))
                     return false;
             }
             return true;
@@ -656,7 +657,6 @@ namespace ast {
     ref_scope scope_of(const type_var::rec_t& v) {
         return v.scope;
     }
-
     maybe_ref_scope scope_of(const type_var::type_alias_t& v) {
         return scope_of(v.type);
     }
@@ -664,11 +664,9 @@ namespace ast {
     maybe_ref_scope scope_of(const T&) {
         return std::nullopt;
     }
-
     maybe_ref_scope scope_of(const type_var::ptr_t& v) {
         return scope_of(v.type);
     }
-
     maybe_ref_scope scope_of(const ref_expr& ptr) {
         return std::visit(
             overload{[](const expr_var::name_t& v) { return scope_of(v.decl); },
@@ -690,14 +688,12 @@ namespace ast {
             },
             ptr.deref().data);
     }
-
     decl_var::rec_member_t rec_field_val(const auto index, const util::field_token f) {
         return {
             .type = f.type,
             .index = index,
         };
     }
-
     std::optional<ref_decl>
     rec_field(env e, const auto index, const util::field_token f) {
         auto opt = alloc_and_insert_decl(e, f.name);
@@ -709,7 +705,6 @@ namespace ast {
         opt->deref().data = rec_field_val(index, f);
         return *opt;
     }
-
     namespace node2ast {
         template <auto... kind>
             requires((cmp_v<decltype(kind), final::e> ||
@@ -927,14 +922,6 @@ namespace ast {
                 expr_var::variant block(env e, cursor& c) {
                     const auto& node = c++.get();
                     return block_fn(e, node);
-                    // ref scope = make_scope(e);
-                    // auto& m = node.as_median().value().get();
-                    // expect<median::PARENS>(m.code);
-
-                    // auto stmts_cursor = cursor(m.children());
-                    // std::println("Value");
-                    // const auto stmts = stmts_fn(e.with(scope), stmts_cursor);
-                    // return expr_var::block_t{util::frame(scope, stmts)};
                 }
 
                 ref_expr parse(env e, cursor& c);
@@ -979,12 +966,9 @@ namespace ast {
                         auto control_ch = cursor{control_med.children()};
                         auto control = expr_fn(e, control_ch);
 
-                        std::println("before block");
-
                         auto& body_node = c++.get();
                         auto body_var = block_fn(e, body_node);
                         auto body = make_expr(e, std::move(body_var));
-                        std::println("after block");
 
                         staging.emplace_back(control, body);
 
@@ -1048,10 +1032,14 @@ namespace ast {
                     else if (v.isa(final::MODULO))
                         return expr_var::op_e::opmod;
 
+                    else if (v.isa(final::LOGICAL_NOT))
+                        return expr_var::op_e::opnot;
                     else if (v.isa(final::LOGICAL_AND))
                         return expr_var::op_e::opand;
                     else if (v.isa(final::LOGICAL_OR))
                         return expr_var::op_e::opor;
+                    else if (v.isa(final::EQUALS))
+                        return expr_var::op_e::opequal;
 
                     else if (v.isa(final::AND))
                         return expr_var::op_e::opbitand;
@@ -1471,7 +1459,6 @@ namespace ast {
         }
 
     } // namespace node2ast
-
     template <typename T>
         requires(is_in_list<std::remove_cvref_t<T>, decl_var::addressable>::value)
     ref_type type_of_decl(const T& v) {
@@ -1539,6 +1526,7 @@ namespace ast {
                     case expr_var::op_e::opbitnot: {
                         return v.operand.deref().type;
                     }
+                    case expr_var::op_e::opequal:
                     case expr_var::op_e::opnot: {
                         auto ptr = allocator.alloc_one<type_t>();
                         ptr->data = type_var::integer_literal_t{};
@@ -1561,6 +1549,24 @@ namespace ast {
                     if (!decl_type)
                         throw_error("Declaration can't have a type");
                     return decl_type.value();
+                },
+                [&](const expr_var::if_t& v) -> ref_type {
+                    ref_type expected = v.branches.front().body.deref().type;
+
+                    for (auto& branch : v.branches) {
+                        ref_type actual = branch.body.deref().type;
+
+                        if (!type_eq<>::eq(expected, actual))
+                            throw_error("if branches have different types");
+                    }
+
+                    if (v.default_branch &&
+                        !type_eq<>::eq(expected, v.default_branch->deref().type)) {
+                        throw_error("default branch have different types with the rest "
+                                    "of the branches");
+                    }
+
+                    return expected;
                 },
                 [&](const expr_var::as_t& v) -> ref_type { return v.type; },
                 [&](const expr_var::block_t& v) -> ref_type {
@@ -2046,37 +2052,7 @@ namespace ast::SLOP {
         }
 
         static constexpr std::string_view op_str(expr_var::op_e op) {
-            switch (op) {
-            case expr_var::op_e::opadd:
-                return "+";
-            case expr_var::op_e::opsub:
-                return "-";
-            case expr_var::op_e::opmul:
-                return "*";
-            case expr_var::op_e::opdiv:
-                return "/";
-            case expr_var::op_e::opmod:
-                return "%";
-            case expr_var::op_e::opand:
-                return "and";
-            case expr_var::op_e::opor:
-                return "or";
-            case expr_var::op_e::opnot:
-                return "not";
-            case expr_var::op_e::opbitand:
-                return "&";
-            case expr_var::op_e::opbitor:
-                return "|";
-            case expr_var::op_e::opbitxor:
-                return "^";
-            case expr_var::op_e::opbitnot:
-                return "!";
-            case expr_var::op_e::opcall:
-                return "<call>";
-            case expr_var::op_e::count:
-                std::unreachable();
-            }
-            std::unreachable();
+            return expr_var::op_meta(op).sym;
         }
 
         void print_type(const type_var::void_t&) {
